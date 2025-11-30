@@ -117,10 +117,17 @@ def process_single_batch(
             cv2.imwrite(str(mask_output), combined)
             logger.info(f"  Saved masks to: {mask_output}")
         
-        # Align
+        # Center images on subjects
+        logger.info("  Centering images on subjects...")
+        from nimslo_core.alignment import center_images_on_subject
+        centered_images, centered_masks, _ = center_images_on_subject(
+            preprocessed, masks
+        )
+        
+        # Align (on centered images)
         logger.info("  Aligning frames...")
         aligned, results = align_images(
-            preprocessed, masks,
+            centered_images, centered_masks,
             n_features=settings["n_features"]
         )
         

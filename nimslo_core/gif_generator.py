@@ -148,6 +148,7 @@ def _crop_to_valid_region(images: List[np.ndarray], threshold: int = 15, margin:
     
     After warping, some images may have black borders. This finds
     the intersection of all valid regions and crops to it.
+    Optimized to handle vertical black bars from horizontal translation.
     
     Args:
         images: List of aligned images
@@ -189,6 +190,26 @@ def _crop_to_valid_region(images: List[np.ndarray], threshold: int = 15, margin:
     
     x, y, valid_w, valid_h = cv2.boundingRect(coords)
     
+    # For vertical bars (horizontal translation), be more aggressive on horizontal cropping
+    # Check if we have significant vertical bars by analyzing column sums
+    gray_combined = cv2.cvtColor(images[0], cv2.COLOR_BGR2GRAY)
+    col_sums = np.sum(gray_combined > threshold, axis=0)  # Sum of valid pixels per column
+    
+    # Find left and right boundaries more precisely
+    # Use a threshold: columns with less than 5% valid pixels are considered black bars
+    min_valid_pixels = h * 0.05
+    valid_cols = np.where(col_sums > min_valid_pixels)[0]
+    
+    if len(valid_cols) > 0:
+        # Update x and valid_w based on column analysis
+        new_x = max(0, valid_cols[0] - margin)
+        new_w = min(w - new_x, valid_cols[-1] - valid_cols[0] + 1 + 2 * margin)
+        
+        # Only use column-based cropping if it's more aggressive (removes more black bars)
+        if new_x > x or (new_x + new_w) < (x + valid_w):
+            x = new_x
+            valid_w = new_w
+    
     # Add margin around valid region
     x = max(0, x - margin)
     y = max(0, y - margin)
@@ -196,8 +217,17 @@ def _crop_to_valid_region(images: List[np.ndarray], threshold: int = 15, margin:
     valid_h = min(h - y, valid_h + 2 * margin)
     
     # Ensure minimum size (don't crop to nothing)
-    if valid_w < 100 or valid_h < 100:
-        return images
+    # But allow more aggressive cropping for width (vertical bars)
+    min_width = max(100, int(w * 0.3))  # At least 30% of original width
+    min_height = max(100, int(h * 0.5))  # At least 50% of original height
+    
+    if valid_w < min_width or valid_h < min_height:
+        # If too aggressive, use original bounding box with smaller margin
+        x, y, valid_w, valid_h = cv2.boundingRect(coords)
+        x = max(0, x - margin // 2)
+        y = max(0, y - margin // 2)
+        valid_w = min(w - x, valid_w + margin)
+        valid_h = min(h - y, valid_h + margin)
     
     # Crop all images
     cropped = [img[y:y+valid_h, x:x+valid_w] for img in images]

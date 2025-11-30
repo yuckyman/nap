@@ -12,24 +12,43 @@ from typing import Tuple, Optional
 
 def denoise_film_grain(
     img: np.ndarray,
-    spatial_radius: int = 8,
-    color_radius: int = 75
+    h: float = 10.0,
+    hColor: float = 10.0,
+    templateWindowSize: int = 7,
+    searchWindowSize: int = 21,
+    **kwargs
 ) -> np.ndarray:
     """
-    Reduce film grain using pyramid mean shift filtering.
+    Reduce film grain using non-local means denoising.
     
     This approach preserves edges while smoothing grain artifacts,
-    outperforming bilateral filtering for film-based images.
+    and is more stable in Jupyter environments than pyramid mean shift filtering.
+    Uses fastNlMeansDenoisingColored for color image denoising.
     
     Args:
         img: Input BGR image
-        spatial_radius: Spatial window radius for mean shift
-        color_radius: Color window radius for mean shift
+        h: Filter strength for luminance component (default: 10.0, good for film grain)
+        hColor: Filter strength for color components (default: 10.0, same as h)
+        templateWindowSize: Size of template patch (default: 7, must be odd)
+        searchWindowSize: Size of search window (default: 21, must be odd)
+        **kwargs: Additional parameters (for backward compatibility, ignored)
         
     Returns:
         Denoised BGR image
     """
-    return cv2.pyrMeanShiftFiltering(img, spatial_radius, color_radius)
+    # Ensure window sizes are odd (required by OpenCV)
+    if templateWindowSize % 2 == 0:
+        templateWindowSize += 1
+    if searchWindowSize % 2 == 0:
+        searchWindowSize += 1
+    
+    return cv2.fastNlMeansDenoisingColored(
+        img,
+        h=h,
+        hColor=hColor,
+        templateWindowSize=templateWindowSize,
+        searchWindowSize=searchWindowSize
+    )
 
 
 def balance_exposure(

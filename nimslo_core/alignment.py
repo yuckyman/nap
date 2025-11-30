@@ -137,6 +137,90 @@ def estimate_homography(
     return H, mask
 
 
+def estimate_translation(
+    kp1: list,
+    kp2: list,
+    matches: List[cv2.DMatch],
+    ransac_threshold: float = 5.0,
+    min_matches: int = 3
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Estimate translation-only transformation from matched keypoints.
+    
+    Only allows translation (x, y shifts), no rotation, scale, or shear.
+    Uses RANSAC to robustly estimate translation in the presence of outliers.
+    
+    Args:
+        kp1: Keypoints from first image
+        kp2: Keypoints from second image
+        matches: List of matches
+        ransac_threshold: RANSAC reprojection threshold in pixels
+        min_matches: Minimum matches required
+        
+    Returns:
+        Tuple of (2x3 translation matrix, inlier mask) or (None, None) if failed
+        Translation matrix is [[1, 0, tx], [0, 1, ty]]
+    """
+    if len(matches) < min_matches:
+        return None, None
+    
+    # Extract matched point coordinates
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches])
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches])
+    
+    # Compute translation vectors for each match
+    translations = dst_pts - src_pts  # Shape: (n_matches, 2)
+    
+    # Use RANSAC to find the best translation
+    # Sample matches, compute median translation, count inliers
+    best_inliers = 0
+    best_translation = None
+    best_mask = None
+    
+    # Adaptive number of iterations based on expected outlier ratio
+    # Formula: log(1-p) / log(1-(1-eps)^s) where p=0.99, eps=0.5, s=3
+    n_iterations = min(100, max(10, int(np.log(0.01) / np.log(0.125))))
+    
+    for _ in range(n_iterations):
+        # Sample a small subset of matches (at least 2, but prefer 3+)
+        sample_size = min(max(2, len(matches) // 4), len(matches))
+        if sample_size < len(matches):
+            sample_indices = np.random.choice(len(matches), size=sample_size, replace=False)
+        else:
+            sample_indices = np.arange(len(matches))
+        
+        sample_translations = translations[sample_indices]
+        
+        # Use median translation (more robust than mean to outliers)
+        candidate_tx = np.median(sample_translations[:, 0])
+        candidate_ty = np.median(sample_translations[:, 1])
+        
+        # Count inliers: matches where reprojection error < threshold
+        predicted_dst = src_pts + np.array([candidate_tx, candidate_ty])
+        errors = np.linalg.norm(predicted_dst - dst_pts, axis=1)
+        inlier_mask = errors < ransac_threshold
+        n_inliers = np.sum(inlier_mask)
+        
+        if n_inliers > best_inliers:
+            best_inliers = n_inliers
+            best_translation = (candidate_tx, candidate_ty)
+            best_mask = inlier_mask
+    
+    # If we found a good translation, refine using all inliers
+    if best_translation is not None and best_inliers >= min_matches:
+        # Refine using median of all inlier translations
+        inlier_translations = translations[best_mask]
+        final_tx = np.median(inlier_translations[:, 0])
+        final_ty = np.median(inlier_translations[:, 1])
+        
+        # Create 2x3 translation matrix
+        M = np.float32([[1, 0, final_tx], [0, 1, final_ty]])
+        
+        return M, best_mask.astype(np.uint8)
+    
+    return None, None
+
+
 def estimate_affine(
     kp1: list,
     kp2: list,
@@ -170,6 +254,106 @@ def estimate_affine(
                                            ransacReprojThreshold=ransac_threshold)
     
     return M, mask
+
+
+def center_images_on_subject(
+    images: List[np.ndarray],
+    masks: List[np.ndarray],
+    target_center: Optional[Tuple[int, int]] = None
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+    """
+    Center all images on their detected subjects.
+    
+    Translates each image so that the centroid of its mask is at the target center.
+    This helps with alignment by ensuring subjects start in similar positions.
+    
+    Args:
+        images: List of BGR images
+        masks: List of binary masks (255 for subject, 0 for background)
+        target_center: Target center point (cx, cy). If None, uses center of first image.
+        
+    Returns:
+        Tuple of (centered_images, centered_masks, translation_matrices)
+        Each translation matrix is 3x3 (homogeneous coordinates)
+    """
+    if len(images) != len(masks):
+        raise ValueError("images and masks must have same length")
+    
+    if not images:
+        return [], [], []
+    
+    h, w = images[0].shape[:2]
+    if target_center is None:
+        target_center = (w // 2, h // 2)
+    
+    centered_images = []
+    centered_masks = []
+    translations = []
+    
+    for img, mask in zip(images, masks):
+        # Find mask centroid
+        M = cv2.moments(mask)
+        if M["m00"] == 0:
+            # No subject detected, use image center (no translation needed)
+            cx, cy = w // 2, h // 2
+        else:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+        
+        # Calculate translation needed
+        dx = target_center[0] - cx
+        dy = target_center[1] - cy
+        
+        # Create translation matrix (2x3 affine)
+        M_trans_affine = np.float32([[1, 0, dx], [0, 1, dy]])
+        
+        # Convert to 3x3 homogeneous for composition
+        M_trans = np.vstack([M_trans_affine, [0, 0, 1]])
+        
+        # Apply translation
+        centered_img = cv2.warpAffine(img, M_trans_affine, (w, h), 
+                                      borderMode=cv2.BORDER_CONSTANT, 
+                                      borderValue=0)
+        centered_mask = cv2.warpAffine(mask, M_trans_affine, (w, h),
+                                       borderMode=cv2.BORDER_CONSTANT,
+                                       borderValue=0)
+        
+        centered_images.append(centered_img)
+        centered_masks.append(centered_mask)
+        translations.append(M_trans)
+    
+    return centered_images, centered_masks, translations
+
+
+def compose_transforms(
+    transform1: np.ndarray,
+    transform2: np.ndarray
+) -> np.ndarray:
+    """
+    Compose two transformation matrices.
+    
+    Result is transform2 @ transform1 (apply transform1 first, then transform2).
+    
+    Args:
+        transform1: First transformation (3x3 or 2x3)
+        transform2: Second transformation (3x3 or 2x3)
+        
+    Returns:
+        Composed transformation (3x3)
+    """
+    # Convert to 3x3 if needed
+    if transform1.shape == (2, 3):
+        T1 = np.vstack([transform1, [0, 0, 1]])
+    else:
+        T1 = transform1
+    
+    if transform2.shape == (2, 3):
+        T2 = np.vstack([transform2, [0, 0, 1]])
+    else:
+        T2 = transform2
+    
+    # Compose: T2 @ T1 (apply T1 first, then T2)
+    return T2 @ T1
 
 
 def calculate_iou(
@@ -216,7 +400,7 @@ def align_pair(
     img2: np.ndarray,
     mask1: Optional[np.ndarray] = None,
     mask2: Optional[np.ndarray] = None,
-    use_affine: bool = True,
+    use_translation_only: bool = True,
     n_features: int = 1000,
     ratio_threshold: float = 0.75,
     ransac_threshold: float = 5.0
@@ -229,7 +413,8 @@ def align_pair(
         img2: Target/reference image
         mask1: Optional mask for img1 subject region
         mask2: Optional mask for img2 subject region
-        use_affine: Use affine (True) or homography (False)
+        use_translation_only: If True, only allow translation (no rotation). 
+                             If False, use affine transformation.
         n_features: Maximum SIFT features
         ratio_threshold: Lowe's ratio test threshold
         ransac_threshold: RANSAC reprojection threshold
@@ -245,10 +430,10 @@ def align_pair(
     matches = match_features(des1, des2, ratio_threshold)
     
     # Estimate transformation
-    if use_affine:
-        transform, inlier_mask = estimate_affine(kp1, kp2, matches, ransac_threshold)
+    if use_translation_only:
+        transform, inlier_mask = estimate_translation(kp1, kp2, matches, ransac_threshold)
     else:
-        transform, inlier_mask = estimate_homography(kp1, kp2, matches, ransac_threshold)
+        transform, inlier_mask = estimate_affine(kp1, kp2, matches, ransac_threshold)
     
     if transform is None:
         result = AlignmentResult(
@@ -260,12 +445,9 @@ def align_pair(
         )
         return None, result
     
-    # Warp image
+    # Warp image (translation and affine both use warpAffine)
     h, w = img2.shape[:2]
-    if use_affine:
-        warped = cv2.warpAffine(img1, transform, (w, h))
-    else:
-        warped = cv2.warpPerspective(img1, transform, (w, h))
+    warped = cv2.warpAffine(img1, transform, (w, h))
     
     # Calculate metrics
     n_inliers = int(np.sum(inlier_mask)) if inlier_mask is not None else 0
@@ -301,6 +483,7 @@ def align_images(
     images: List[np.ndarray],
     masks: Optional[List[np.ndarray]] = None,
     reference_idx: int = 0,
+    use_translation_only: bool = True,
     **kwargs
 ) -> Tuple[List[np.ndarray], List[AlignmentResult]]:
     """
@@ -310,6 +493,7 @@ def align_images(
         images: List of BGR images
         masks: Optional list of masks for each image
         reference_idx: Index of reference image (default: first image)
+        use_translation_only: If True, only allow translation (no rotation)
         **kwargs: Additional arguments passed to align_pair
         
     Returns:
@@ -339,6 +523,7 @@ def align_images(
             warped, result = align_pair(
                 img, ref_img,
                 mask, ref_mask,
+                use_translation_only=use_translation_only,
                 **kwargs
             )
             
@@ -426,4 +611,5 @@ def visualize_matches(
     )
     
     return vis
+
 
