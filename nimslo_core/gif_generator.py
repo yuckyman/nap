@@ -7,8 +7,153 @@ Creates smooth boomerang-style animated GIFs from aligned frames.
 import cv2
 import numpy as np
 from PIL import Image
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
+
+
+def make_boomerang_frames(
+    images: List[np.ndarray],
+    crop_valid_region: bool = True,
+    normalize_brightness: bool = True,
+    brightness_strength: float = 0.5
+) -> List[np.ndarray]:
+    """
+    Create boomerang frame sequence from aligned images.
+    
+    The sequence plays forward then backward: 1→2→3→4→3→2→1
+    
+    Args:
+        images: List of aligned BGR images
+        crop_valid_region: Whether to crop to valid (non-black) region
+        normalize_brightness: Whether to normalize brightness across frames to prevent flashing
+        brightness_strength: Strength of brightness normalization (0.0-1.0, default 0.5)
+                             0.0 = no correction, 1.0 = full correction to median
+        
+    Returns:
+        List of BGR frames in boomerang order
+    """
+    if not images:
+        raise ValueError("No images provided")
+    
+    if crop_valid_region:
+        images = _crop_to_valid_region(images)
+    
+    if normalize_brightness:
+        images = _normalize_brightness(images, strength=brightness_strength)
+    
+    if len(images) > 1:
+        return images + images[-2:0:-1]
+    return images
+
+
+def encode_gif(
+    frames: List[np.ndarray],
+    output_path: Union[str, Path],
+    duration: int = 100,
+    loop: int = 0,
+    optimize: bool = True
+) -> Path:
+    """
+    Encode a list of frames into a GIF.
+    
+    Args:
+        frames: List of BGR frames
+        output_path: Path for output GIF
+        duration: Duration per frame in milliseconds
+        loop: Number of loops (0 = infinite)
+        optimize: Whether to optimize GIF file size
+        
+    Returns:
+        Path to created GIF
+    """
+    if not frames:
+        raise ValueError("No frames provided")
+    
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    pil_frames = []
+    for frame in frames:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_frames.append(Image.fromarray(rgb))
+    
+    pil_frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=duration,
+        loop=loop,
+        optimize=optimize
+    )
+    
+    return output_path
+
+
+def encode_mp4(
+    frames: List[np.ndarray],
+    output_path: Union[str, Path],
+    fps: Optional[float] = None,
+    duration: int = 100,
+    crf: int = 18,
+    preset: str = "slow"
+) -> Path:
+    """
+    Encode a list of frames into an MP4 using ffmpeg (H.264).
+    
+    Args:
+        frames: List of BGR frames
+        output_path: Path for output MP4
+        fps: Frames per second (if None, derived from duration)
+        duration: Duration per frame in milliseconds (used if fps is None)
+        crf: H.264 quality factor (lower is higher quality)
+        preset: H.264 encoding preset (e.g., slow, medium, fast)
+        
+    Returns:
+        Path to created MP4
+    """
+    if not frames:
+        raise ValueError("No frames provided")
+    
+    if fps is None:
+        fps = 1000 / duration if duration > 0 else 10
+    
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is required to encode MP4 outputs")
+    
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        for i, frame in enumerate(frames, start=1):
+            frame_path = temp_path / f"frame_{i:04d}.png"
+            cv2.imwrite(str(frame_path), frame)
+        
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            f"{fps:.3f}",
+            "-i",
+            str(temp_path / "frame_%04d.png"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    return output_path
 
 
 def create_boomerang_gif(
@@ -40,42 +185,13 @@ def create_boomerang_gif(
     Returns:
         Path to created GIF
     """
-    if not images:
-        raise ValueError("No images provided")
-    
-    output_path = Path(output_path)
-    
-    # Optionally crop to valid region
-    if crop_valid_region:
-        images = _crop_to_valid_region(images)
-    
-    # Normalize brightness across frames to prevent flashing
-    if normalize_brightness:
-        images = _normalize_brightness(images, strength=brightness_strength)
-    
-    # Convert to PIL images (RGB)
-    pil_images = []
-    for img in images:
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        pil_images.append(Image.fromarray(rgb))
-    
-    # Create boomerang sequence: forward + reverse (excluding endpoints)
-    if len(pil_images) > 1:
-        boomerang = pil_images + pil_images[-2:0:-1]
-    else:
-        boomerang = pil_images
-    
-    # Save as GIF
-    boomerang[0].save(
-        output_path,
-        save_all=True,
-        append_images=boomerang[1:],
-        duration=duration,
-        loop=loop,
-        optimize=optimize
+    frames = make_boomerang_frames(
+        images,
+        crop_valid_region=crop_valid_region,
+        normalize_brightness=normalize_brightness,
+        brightness_strength=brightness_strength
     )
-    
-    return output_path
+    return encode_gif(frames, output_path, duration=duration, loop=loop, optimize=optimize)
 
 
 def _normalize_brightness(images: List[np.ndarray], strength: float = 0.5) -> List[np.ndarray]:
@@ -488,4 +604,3 @@ def get_gif_info(gif_path: Union[str, Path]) -> dict:
             info["duration_ms"] = 0
     
     return info
-
