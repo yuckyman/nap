@@ -34,7 +34,8 @@ def setup_path():
 def process_single_batch(
     batch_path: Path,
     output_path: Path,
-    quality: str = "balanced",
+    output_format: str,
+    quality: str = "best",
     show_masks: bool = False,
     preview: bool = False
 ) -> dict:
@@ -56,7 +57,7 @@ def process_single_batch(
     from nimslo_core.preprocessing import preprocess_image, normalize_sizes
     from nimslo_core.segmentation import get_segmentation_mask
     from nimslo_core.alignment import align_images
-    from nimslo_core.gif_generator import create_boomerang_gif, resize_for_web
+    from nimslo_core.gif_generator import make_boomerang_frames, encode_gif, encode_mp4, resize_for_web
     
     # Quality presets
     quality_settings = {
@@ -142,28 +143,38 @@ def process_single_batch(
             if i > 0:  # Skip reference
                 logger.info(f"    Frame {i+1}: {r.total_matches} matches, {r.inliers} inliers, IoU: {r.iou:.2f}")
         
-        # Generate GIF
-        logger.info("  Generating GIF...")
-        web_images = resize_for_web(aligned, max_dimension=settings["max_dimension"])
-        gif_path = create_boomerang_gif(
-            web_images, 
-            output_path,
+        # Build boomerang frames from aligned images
+        logger.info("  Building boomerang frames...")
+        boomerang_frames = make_boomerang_frames(
+            aligned,
             crop_valid_region=True,
             normalize_brightness=True,  # Prevent flashing from exposure differences
             brightness_strength=0.5  # Moderate correction (0.0-1.0)
         )
         
+        if output_format == "gif":
+            logger.info("  Generating GIF...")
+            web_frames = resize_for_web(boomerang_frames, max_dimension=settings["max_dimension"])
+            output_path = output_path.with_suffix(".gif")
+            output_path = encode_gif(web_frames, output_path)
+        elif output_format == "mp4":
+            logger.info("  Generating MP4...")
+            output_path = output_path.with_suffix(".mp4")
+            output_path = encode_mp4(boomerang_frames, output_path)
+        else:
+            raise ValueError(f"Unsupported format: {output_format}")
+        
         result["success"] = True
-        result["output_path"] = gif_path
-        result["size_kb"] = gif_path.stat().st_size / 1024
+        result["output_path"] = output_path
+        result["size_kb"] = output_path.stat().st_size / 1024
         result["avg_iou"] = np.mean([r.iou for r in results[1:]])
         
-        logger.info(f"  ✓ Saved: {gif_path} ({result['size_kb']:.1f} KB)")
+        logger.info(f"  ✓ Saved: {output_path} ({result['size_kb']:.1f} KB)")
         
         # Preview if requested
         if preview:
             import subprocess
-            subprocess.run(["open", str(gif_path)], check=False)
+            subprocess.run(["open", str(output_path)], check=False)
         
     except Exception as e:
         result["error"] = str(e)
@@ -175,7 +186,8 @@ def process_single_batch(
 def process_batch_directory(
     input_dir: Path,
     output_dir: Path,
-    quality: str = "balanced",
+    output_format: str,
+    quality: str = "best",
     show_masks: bool = False
 ) -> List[dict]:
     """
@@ -206,9 +218,10 @@ def process_batch_directory(
     results = []
     for i, batch_dir in enumerate(batch_dirs):
         logger.info(f"\n[{i+1}/{len(batch_dirs)}] Processing {batch_dir.name}...")
-        output_path = output_dir / f"{batch_dir.name}.gif"
+        output_path = output_dir / f"{batch_dir.name}.{output_format}"
         result = process_single_batch(
             batch_dir, output_path,
+            output_format=output_format,
             quality=quality,
             show_masks=show_masks
         )
@@ -239,11 +252,12 @@ def process_batch_directory(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Align Nimslo 4-lens camera images and generate boomerang GIFs",
+        description="Align Nimslo 4-lens camera images and generate boomerang GIFs or MP4s",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s ./nimslo_raw/01/ -o my_photo.gif
+  %(prog)s ./nimslo_raw/01/ -o my_photo.mp4 --format mp4
   %(prog)s ./nimslo_raw/ --batch -o ./outputs/
   %(prog)s ./batch/ -q best --show-masks --preview
         """
@@ -271,8 +285,15 @@ Examples:
     parser.add_argument(
         "-q", "--quality",
         choices=["fast", "balanced", "best"],
-        default="balanced",
-        help="Quality preset (default: balanced)"
+        default="best",
+        help="Quality preset (default: best)"
+    )
+
+    parser.add_argument(
+        "--format",
+        choices=["gif", "mp4"],
+        default=None,
+        help="Output format (gif or mp4). If omitted, inferred from output extension."
     )
     
     parser.add_argument(
@@ -306,12 +327,21 @@ Examples:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    def resolve_output_format(output_path: Optional[Path]) -> str:
+        if args.format:
+            return args.format
+        if output_path and output_path.suffix.lower() in {".gif", ".mp4"}:
+            return output_path.suffix.lower().lstrip(".")
+        return "gif"
+    
     if args.batch:
         # Batch mode
         output_dir = args.output or args.input / "aligned_output"
+        output_format = resolve_output_format(args.output)
         results = process_batch_directory(
             args.input,
             output_dir,
+            output_format=output_format,
             quality=args.quality,
             show_masks=args.show_masks
         )
@@ -322,16 +352,18 @@ Examples:
     else:
         # Single batch mode
         output_path = args.output
+        output_format = resolve_output_format(output_path)
         if output_path is None:
-            output_path = args.input.parent / f"{args.input.name}_aligned.gif"
+            output_path = args.input.parent / f"{args.input.name}_aligned.{output_format}"
         
         if output_path.is_dir():
-            output_path = output_path / f"{args.input.name}.gif"
+            output_path = output_path / f"{args.input.name}.{output_format}"
         
         logger.info(f"Processing {args.input.name}...")
         result = process_single_batch(
             args.input,
             output_path,
+            output_format=output_format,
             quality=args.quality,
             show_masks=args.show_masks,
             preview=args.preview
@@ -344,4 +376,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-

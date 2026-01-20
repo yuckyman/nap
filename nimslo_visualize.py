@@ -214,7 +214,7 @@ def process_single_batch(
     batch_path: Path,
     output_path: Path,
     viz_dir: Optional[Path] = None,
-    quality: str = "balanced",
+    quality: str = "best",
     show_masks: bool = False,
     preview: bool = False
 ) -> dict:
@@ -454,8 +454,8 @@ Examples:
     parser.add_argument(
         "-q", "--quality",
         choices=["fast", "balanced", "best"],
-        default="balanced",
-        help="Quality preset (default: balanced)"
+        default="best",
+        help="Quality preset (default: best)"
     )
     
     parser.add_argument(
@@ -508,4 +508,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-
