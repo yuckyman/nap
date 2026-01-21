@@ -37,7 +37,8 @@ def process_single_batch(
     output_format: str,
     quality: str = "best",
     show_masks: bool = False,
-    preview: bool = False
+    preview: bool = False,
+    mp4_loops: Optional[int] = None
 ) -> dict:
     """
     Process a single batch of 4 images.
@@ -179,7 +180,7 @@ def process_single_batch(
             output_path = output_path.with_suffix(".mp4")
             # Default: make MP4 longer by repeating the boomerang sequence.
             # Use grain-preserving encoder settings by default.
-            output_path = encode_mp4(boomerang_frames, output_path)
+            output_path = encode_mp4(boomerang_frames, output_path, loops=mp4_loops if mp4_loops is not None else 1)
         else:
             raise ValueError(f"Unsupported format: {output_format}")
         
@@ -207,7 +208,8 @@ def process_batch_directory(
     output_dir: Path,
     output_format: str,
     quality: str = "best",
-    show_masks: bool = False
+    show_masks: bool = False,
+    mp4_loops: Optional[int] = None
 ) -> List[dict]:
     """
     Process all batch directories within input_dir.
@@ -242,7 +244,8 @@ def process_batch_directory(
             batch_dir, output_path,
             output_format=output_format,
             quality=quality,
-            show_masks=show_masks
+            show_masks=show_masks,
+            mp4_loops=mp4_loops
         )
         results.append(result)
     
@@ -332,6 +335,20 @@ Examples:
         action="store_true",
         help="Enable verbose output"
     )
+
+    parser.add_argument(
+        "--loops",
+        type=int,
+        default=None,
+        help="MP4 only: number of boomerang loops to concatenate (default: 1)"
+    )
+
+    parser.add_argument(
+        "--longer",
+        type=int,
+        default=None,
+        help="MP4 only: alias for --loops (e.g. --longer 6)"
+    )
     
     args = parser.parse_args()
     
@@ -357,12 +374,14 @@ Examples:
         # Batch mode
         output_dir = args.output or args.input / "aligned_output"
         output_format = resolve_output_format(args.output)
+        mp4_loops = args.loops if args.loops is not None else (args.longer if args.longer is not None else None)
         results = process_batch_directory(
             args.input,
             output_dir,
             output_format=output_format,
             quality=args.quality,
-            show_masks=args.show_masks
+            show_masks=args.show_masks,
+            mp4_loops=mp4_loops
         )
         
         # Exit with error if any failed
@@ -385,7 +404,8 @@ Examples:
             output_format=output_format,
             quality=args.quality,
             show_masks=args.show_masks,
-            preview=args.preview
+            preview=args.preview,
+            mp4_loops=(args.loops if args.loops is not None else (args.longer if args.longer is not None else None))
         )
         
         if not result["success"]:
