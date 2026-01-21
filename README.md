@@ -7,7 +7,8 @@ a python pipeline for aligning 4-lens nimslo camera photos into smooth stereosco
 1. **preprocessing** - reduces film grain and normalizes exposure across frames
 2. **segmentation** - detects the main subject using u²-net (or depth-based fallback)
 3. **alignment** - uses sift feature matching to align frames, centering on the subject
-4. **gif generation** - creates a boomerang gif (1→2→3→4→3→2→1) with brightness normalization
+4. **render** - applies transforms to the *original scans* (keeps film grain)
+5. **export** - outputs either gif or mp4 boomerangs with cropping + brightness normalization
 
 ## structure
 
@@ -57,10 +58,29 @@ options:
   -o, --output PATH     output path (file for single, directory for batch)
   --batch               process all subdirectories as batches
   -q, --quality         quality preset: fast, balanced (default), best
+  --format              output format: gif or mp4 (otherwise inferred from -o)
   --show-masks          save segmentation mask visualization
   --preview             open result after processing (single mode only)
   -v, --verbose         enable verbose output
 ```
+
+### mp4 defaults (high fidelity / film grain friendly)
+
+mp4 export uses `ffmpeg` + `libx264` and is tuned to preserve grain:
+
+- **fps**: 10
+- **loops**: 6 (seam-safe; avoids a “pause” at loop boundary)
+- **tune**: grain
+- **crf**: 18 (good quality / reasonable size)
+- **even dimensions**: enforced via 1px crop when needed (no resampling blur)
+- **edge crop**: removes warp borders by intersecting valid regions across frames
+
+### 3-frame fallback
+
+if a batch only has 3 scans (mechanical failure / dev issues), the cli will still run and the boomerang becomes:
+
+- **3 frames**: 1→2→3→2→1
+- **4 frames**: 1→2→3→4→3→2→1
 
 ### quality presets
 
@@ -115,6 +135,7 @@ see `requirements.txt` in parent directory. key deps:
 - `rembg` + `onnxruntime` - u²-net segmentation
 - `pillow` - image i/o
 - `matplotlib` - visualizations (optional)
+- `ffmpeg` - required for mp4 export
 
 ## known issues
 

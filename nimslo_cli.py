@@ -56,7 +56,7 @@ def process_single_batch(
     import numpy as np
     from nimslo_core.preprocessing import preprocess_image, normalize_sizes
     from nimslo_core.segmentation import get_segmentation_mask
-    from nimslo_core.alignment import align_images
+    from nimslo_core.alignment import align_images, center_images_on_subject
     from nimslo_core.gif_generator import make_boomerang_frames, encode_gif, encode_mp4, resize_for_web
     
     # Quality presets
@@ -77,24 +77,33 @@ def process_single_batch(
     try:
         # Find and load images
         image_files = sorted(batch_path.glob("*.jpg")) + sorted(batch_path.glob("*.JPG"))
-        if len(image_files) < 4:
-            result["error"] = f"Expected 4 images, found {len(image_files)}"
+        if len(image_files) < 3:
+            result["error"] = f"Need at least 3 images, found {len(image_files)}"
             return result
         
-        image_files = image_files[:4]  # Take first 4 if more exist
+        # Use 4 images if available, fallback to 3 (mechanical/dev issues)
+        if len(image_files) >= 4:
+            image_files = image_files[:4]
+        else:
+            image_files = image_files[:3]
+            logger.info("  ⚠ Only 3 images found - using 1→2→3→2→1 boomerang")
         logger.info(f"  Loading {len(image_files)} images...")
         
-        images = []
+        images_original = []
         for f in image_files:
             img = cv2.imread(str(f))
             if img is None:
                 result["error"] = f"Failed to load {f.name}"
                 return result
-            images.append(img)
+            images_original.append(img)
+        
+        # Normalize originals first so any later warps match shapes
+        images_original = normalize_sizes(images_original)
         
         # Preprocess
         logger.info("  Preprocessing...")
-        preprocessed = [preprocess_image(img, denoise=settings["denoise"]) for img in images]
+        # Preprocess (used for segmentation + robust alignment), but keep originals for final render
+        preprocessed = [preprocess_image(img, denoise=settings["denoise"]) for img in images_original]
         preprocessed = normalize_sizes(preprocessed)
         
         # Segment
@@ -127,13 +136,13 @@ def process_single_batch(
         # Center images on subjects
         logger.info("  Centering images on subjects...")
         from nimslo_core.alignment import center_images_on_subject
-        centered_images, centered_masks, _ = center_images_on_subject(
+        centered_images, centered_masks, center_transforms = center_images_on_subject(
             preprocessed, masks
         )
         
         # Align (on centered images)
         logger.info("  Aligning frames...")
-        aligned, results = align_images(
+        _, results = align_images(
             centered_images, centered_masks,
             n_features=settings["n_features"]
         )
@@ -143,10 +152,18 @@ def process_single_batch(
             if i > 0:  # Skip reference
                 logger.info(f"    Frame {i+1}: {r.total_matches} matches, {r.inliers} inliers, IoU: {r.iou:.2f}")
         
-        # Build boomerang frames from aligned images
+        # Apply the *same* transforms to the original (non-denoised) scans to preserve film grain.
+        h, w = images_original[0].shape[:2]
+        aligned_originals = []
+        for img_orig, center_T, align_r in zip(images_original, center_transforms, results):
+            combined_T = align_r.transform @ center_T
+            warped = cv2.warpPerspective(img_orig, combined_T, (w, h))
+            aligned_originals.append(warped)
+        
+        # Build boomerang frames from grain-preserving aligned originals
         logger.info("  Building boomerang frames...")
         boomerang_frames = make_boomerang_frames(
-            aligned,
+            aligned_originals,
             crop_valid_region=True,
             normalize_brightness=True,  # Prevent flashing from exposure differences
             brightness_strength=0.5  # Moderate correction (0.0-1.0)
@@ -160,6 +177,8 @@ def process_single_batch(
         elif output_format == "mp4":
             logger.info("  Generating MP4...")
             output_path = output_path.with_suffix(".mp4")
+            # Default: make MP4 longer by repeating the boomerang sequence.
+            # Use grain-preserving encoder settings by default.
             output_path = encode_mp4(boomerang_frames, output_path)
         else:
             raise ValueError(f"Unsupported format: {output_format}")
