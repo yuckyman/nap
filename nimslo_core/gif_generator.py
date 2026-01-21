@@ -145,6 +145,18 @@ def encode_mp4(
     if loops is None:
         loops = 1
     loops = int(max(1, loops))
+    
+    # Make single-loop MP4s "stackable": avoid ending on the same frame we start with.
+    # Our boomerang sequences typically start and end on frame 1 (e.g. 1→2→3→4→3→2→1).
+    # Dropping the trailing frame prevents a visible pause when concatenating MP4s externally.
+    if loops == 1 and len(frames) > 1:
+        try:
+            if (frames[0] is frames[-1]) or np.array_equal(frames[0], frames[-1]):
+                frames = frames[:-1]
+        except Exception:
+            # If anything goes sideways (unlikely), just keep original frames.
+            pass
+
     if loops > 1:
         # Avoid a visible "pause" at loop boundaries by not duplicating the first frame
         # on each repetition. This assumes the boomerang sequence ends on frame 1.
