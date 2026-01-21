@@ -45,8 +45,27 @@ def make_boomerang_frames(
         images = _normalize_brightness(images, strength=brightness_strength)
     
     if len(images) > 1:
-        return images + images[-2:0:-1]
-    return images
+        # Loop-safe boomerang: end on the first frame so repeating doesn't "jump".
+        # 4 frames: 1,2,3,4,3,2,1
+        # 3 frames: 1,2,3,2,1
+        frames = images + images[-2::-1]
+    else:
+        frames = images
+    
+    # Force even dimensions (H.264 yuv420p requires even width/height).
+    # Crop by 1px if needed; avoids resampling blur.
+    frames = [_crop_to_even_dimensions(f) for f in frames]
+    return frames
+
+
+def _crop_to_even_dimensions(img: np.ndarray) -> np.ndarray:
+    """Crop image by 1px if needed to make width/height even (no resampling)."""
+    h, w = img.shape[:2]
+    new_w = w - (w % 2)
+    new_h = h - (h % 2)
+    if new_w == w and new_h == h:
+        return img
+    return img[:new_h, :new_w]
 
 
 def encode_gif(
@@ -95,10 +114,12 @@ def encode_gif(
 def encode_mp4(
     frames: List[np.ndarray],
     output_path: Union[str, Path],
-    fps: Optional[float] = None,
+    fps: Optional[float] = 10.0,
     duration: int = 100,
+    loops: int = 6,
     crf: int = 18,
-    preset: str = "slow"
+    preset: str = "slow",
+    tune: str = "grain"
 ) -> Path:
     """
     Encode a list of frames into an MP4 using ffmpeg (H.264).
@@ -108,17 +129,33 @@ def encode_mp4(
         output_path: Path for output MP4
         fps: Frames per second (if None, derived from duration)
         duration: Duration per frame in milliseconds (used if fps is None)
+        loops: Number of times to repeat the boomerang sequence (default: 10)
         crf: H.264 quality factor (lower is higher quality)
         preset: H.264 encoding preset (e.g., slow, medium, fast)
+        tune: x264 tuning (e.g. grain, film, animation)
         
     Returns:
         Path to created MP4
     """
     if not frames:
         raise ValueError("No frames provided")
+
+    # Default behavior: make MP4s longer by repeating the loop.
+    # This is cheap because our sequences are short (typically 4-6 frames).
+    if loops is None:
+        loops = 1
+    loops = int(max(1, loops))
+    if loops > 1:
+        # Avoid a visible "pause" at loop boundaries by not duplicating the first frame
+        # on each repetition. This assumes the boomerang sequence ends on frame 1.
+        base = frames
+        frames = list(base)
+        for _ in range(loops - 1):
+            frames.extend(base[1:])
     
     if fps is None:
-        fps = 1000 / duration if duration > 0 else 10
+        # Default to 10fps (slower, more filmic). Duration is ignored when fps is set.
+        fps = 10.0
     
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required to encode MP4 outputs")
@@ -135,23 +172,47 @@ def encode_mp4(
         cmd = [
             "ffmpeg",
             "-y",
+            "-hide_banner",
             "-framerate",
             f"{fps:.3f}",
+            "-start_number",
+            "1",
             "-i",
             str(temp_path / "frame_%04d.png"),
+            # Frames are pre-cropped to even dimensions; keep filter as CFR only.
+            "-vf",
+            f"fps={fps:.3f}",
+            # Force constant frame rate output (prevents some players from “hanging”).
+            "-fps_mode",
+            "cfr",
+            "-r",
+            f"{fps:.3f}",
             "-c:v",
             "libx264",
+            "-tune",
+            tune,
             "-preset",
             preset,
             "-crf",
             str(crf),
+            # Avoid some grain-smearing ratecontrol heuristics; keep grain texture.
+            "-x264-params",
+            "mbtree=0",
             "-pix_fmt",
             "yuv420p",
             "-movflags",
             "+faststart",
             str(output_path),
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as e:
+            stderr = ""
+            try:
+                stderr = (e.stderr or b"").decode("utf-8", errors="replace")
+            except Exception:
+                stderr = str(e)
+            raise RuntimeError(f"ffmpeg mp4 encode failed: {stderr.strip()}") from e
     
     return output_path
 
@@ -336,118 +397,76 @@ def _crop_based_on_transforms(images: List[np.ndarray], transforms: List[np.ndar
     return cropped
 
 
-def _crop_to_valid_region(images: List[np.ndarray], threshold: int = 15, margin: int = 10) -> List[np.ndarray]:
+def _crop_to_valid_region(
+    images: List[np.ndarray],
+    threshold: int = 20,
+    margin: int = 2,
+    erode_px: int = 2
+) -> List[np.ndarray]:
     """
-    Crop all images to the common valid (non-black) region.
+    Crop all images to the common valid (non-border) region.
     
-    After warping, some images may have black borders. This finds
-    the intersection of all valid regions and crops to it.
-    Optimized to handle vertical black bars from horizontal translation:
-    - Aggressively crops vertically (top/bottom black bars)
-    - Preserves horizontal dimensions (minimal horizontal cropping)
+    Robust against thin black strips along entire edges after warping:
+    - build a valid mask per frame (gray > threshold)
+    - keep only the main connected component (center-connected / largest)
+    - AND masks across frames so any border in any frame is removed
+    - erode slightly to remove residual edge pixels
     
-    Args:
-        images: List of aligned images
-        threshold: Gray value threshold (pixels darker than this are considered black)
-        margin: Margin to add around the valid region (in pixels)
-        
-    Returns:
-        List of cropped images
+    Returns original images if no safe crop found.
     """
     if not images:
         return images
     
     h, w = images[0].shape[:2]
+    if any(img.shape[:2] != (h, w) for img in images):
+        return images
     
-    # Find valid region for each image
-    valid_masks = []
+    cy, cx = h // 2, w // 2
+    masks: List[np.ndarray] = []
+    
     for img in images:
-        # Consider pixel valid if not black/dark (more aggressive threshold)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Use higher threshold to exclude dark borders
-        valid = (gray > threshold).astype(np.uint8) * 255
-        valid_masks.append(valid)
+        valid = (gray > threshold).astype(np.uint8)
+        
+        num_labels, labels = cv2.connectedComponents(valid, connectivity=8)
+        if num_labels <= 1:
+            masks.append(valid * 255)
+            continue
+        
+        center_label = labels[cy, cx]
+        if center_label != 0:
+            keep_label = int(center_label)
+        else:
+            counts = np.bincount(labels.reshape(-1))
+            counts[0] = 0
+            keep_label = int(np.argmax(counts))
+        
+        main = (labels == keep_label).astype(np.uint8) * 255
+        masks.append(main)
     
-    # Intersection of all valid regions (all frames must have content)
-    combined_mask = valid_masks[0].copy()
-    for mask in valid_masks[1:]:
-        combined_mask = cv2.bitwise_and(combined_mask, mask)
+    combined = masks[0].copy()
+    for m in masks[1:]:
+        combined = cv2.bitwise_and(combined, m)
     
-    # Find bounding box of valid region
-    coords = cv2.findNonZero(combined_mask)
+    if erode_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * erode_px + 1, 2 * erode_px + 1))
+        combined = cv2.erode(combined, k, iterations=1)
+    
+    coords = cv2.findNonZero(combined)
     if coords is None:
-        # Fallback: use union instead of intersection if intersection is empty
-        combined_mask = valid_masks[0].copy()
-        for mask in valid_masks[1:]:
-            combined_mask = cv2.bitwise_or(combined_mask, mask)
-        coords = cv2.findNonZero(combined_mask)
-        if coords is None:
-            return images  # No valid region found at all
+        return images
     
-    x, y, valid_w, valid_h = cv2.boundingRect(coords)
+    x, y, cw, ch = cv2.boundingRect(coords)
+    x0 = max(0, x - margin)
+    y0 = max(0, y - margin)
+    x1 = min(w, x + cw + margin)
+    y1 = min(h, y + ch + margin)
     
-    # Analyze row sums to detect horizontal black bars (top/bottom)
-    # This helps us be more aggressive with vertical cropping
-    gray_combined = cv2.cvtColor(images[0], cv2.COLOR_BGR2GRAY)
-    row_sums = np.sum(gray_combined > threshold, axis=1)  # Sum of valid pixels per row
+    # Safety: don't crop too aggressively
+    if (x1 - x0) < int(w * 0.5) or (y1 - y0) < int(h * 0.5):
+        return images
     
-    # Find top and bottom boundaries more precisely
-    # Use a threshold: rows with less than 5% valid pixels are considered black bars
-    min_valid_pixels_per_row = w * 0.05
-    valid_rows = np.where(row_sums > min_valid_pixels_per_row)[0]
-    
-    if len(valid_rows) > 0:
-        # Update y and valid_h based on row analysis (more aggressive vertical cropping)
-        new_y = max(0, valid_rows[0] - margin // 2)  # Smaller margin for vertical
-        new_h = min(h - new_y, valid_rows[-1] - valid_rows[0] + 1 + margin)  # Smaller margin
-        
-        # Use row-based cropping if it removes more black bars
-        if new_y > y or (new_y + new_h) < (y + valid_h):
-            y = new_y
-            valid_h = new_h
-    
-    # For horizontal dimension, be conservative - only crop if there are clear vertical bars
-    # Analyze column sums to detect vertical black bars (left/right)
-    col_sums = np.sum(gray_combined > threshold, axis=0)  # Sum of valid pixels per column
-    min_valid_pixels_per_col = h * 0.10  # Higher threshold - only crop if 10%+ of height is black
-    valid_cols = np.where(col_sums > min_valid_pixels_per_col)[0]
-    
-    if len(valid_cols) > 0:
-        # Only crop horizontally if there are significant vertical bars
-        # Be conservative: use larger margin and only if it's clearly a black bar
-        new_x = max(0, valid_cols[0] - margin * 2)  # Larger margin to preserve width
-        new_w = min(w - new_x, valid_cols[-1] - valid_cols[0] + 1 + margin * 4)  # Preserve more width
-        
-        # Only use column-based cropping if it's clearly removing black bars
-        # and doesn't crop too aggressively (preserve at least 80% of width)
-        if (new_x > x or (new_x + new_w) < (x + valid_w)) and new_w > w * 0.8:
-            x = new_x
-            valid_w = new_w
-    
-    # Add margin around valid region
-    # Use smaller vertical margin (more aggressive cropping) and larger horizontal margin (preserve width)
-    x = max(0, x - margin * 2)  # Larger horizontal margin to preserve width
-    y = max(0, y - margin // 2)  # Smaller vertical margin for aggressive cropping
-    valid_w = min(w - x, valid_w + margin * 4)  # Preserve more horizontal space
-    valid_h = min(h - y, valid_h + margin)  # Less vertical padding
-    
-    # Ensure minimum size (don't crop to nothing)
-    # Preserve more width, allow more aggressive height cropping
-    min_width = max(100, int(w * 0.75))  # Preserve at least 75% of original width
-    min_height = max(100, int(h * 0.3))  # Allow cropping to 30% of original height
-    
-    if valid_w < min_width or valid_h < min_height:
-        # If too aggressive, use original bounding box with adjusted margins
-        x, y, valid_w, valid_h = cv2.boundingRect(coords)
-        x = max(0, x - margin * 2)  # Preserve width
-        y = max(0, y - margin // 2)  # Aggressive vertical cropping
-        valid_w = min(w - x, valid_w + margin * 2)  # Preserve width
-        valid_h = min(h - y, valid_h + margin)  # Less vertical padding
-    
-    # Crop all images
-    cropped = [img[y:y+valid_h, x:x+valid_w] for img in images]
-    
-    return cropped
+    return [img[y0:y1, x0:x1] for img in images]
 
 
 def create_side_by_side(

@@ -51,8 +51,11 @@ Thumbs.db
 *.gif
 *.jpg
 *.png
+*.mp4
 test_*.gif
 outputs/
+output/
+output_mp4/
 
 # Model cache (optional - uncomment if you want to ignore)
 # ~/.u2net/
