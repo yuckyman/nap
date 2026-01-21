@@ -69,7 +69,7 @@ options:
 mp4 export uses `ffmpeg` + `libx264` and is tuned to preserve grain:
 
 - **fps**: 10
-- **loops**: 6 (seam-safe; avoids a “pause” at loop boundary)
+- **loops**: 1 (default). use `--longer N` (or `--loops N`) to concatenate more loops.
 - **tune**: grain
 - **crf**: 18 (good quality / reasonable size)
 - **even dimensions**: enforced via 1px crop when needed (no resampling blur)

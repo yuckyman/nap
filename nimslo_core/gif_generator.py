@@ -116,7 +116,7 @@ def encode_mp4(
     output_path: Union[str, Path],
     fps: Optional[float] = 10.0,
     duration: int = 100,
-    loops: int = 6,
+    loops: int = 1,
     crf: int = 18,
     preset: str = "slow",
     tune: str = "grain"
