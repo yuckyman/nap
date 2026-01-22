@@ -18,12 +18,17 @@ def make_boomerang_frames(
     images: List[np.ndarray],
     crop_valid_region: bool = True,
     normalize_brightness: bool = True,
-    brightness_strength: float = 0.5
+    brightness_strength: float = 0.5,
+    end_on_first: bool = True,
+    force_even_dimensions: bool = False
 ) -> List[np.ndarray]:
     """
     Create boomerang frame sequence from aligned images.
     
-    The sequence plays forward then backward: 1→2→3→4→3→2→1
+    The sequence plays forward then backward.
+    
+    - If end_on_first=True:  1→2→3→4→3→2→1  (stack/concat friendly for video)
+    - If end_on_first=False: 1→2→3→4→3→2    (GIF-loop friendly; avoids duplicating frame 1)
     
     Args:
         images: List of aligned BGR images
@@ -45,16 +50,21 @@ def make_boomerang_frames(
         images = _normalize_brightness(images, strength=brightness_strength)
     
     if len(images) > 1:
-        # Loop-safe boomerang: end on the first frame so repeating doesn't "jump".
-        # 4 frames: 1,2,3,4,3,2,1
-        # 3 frames: 1,2,3,2,1
-        frames = images + images[-2::-1]
+        if end_on_first:
+            # 4 frames: 1,2,3,4,3,2,1
+            # 3 frames: 1,2,3,2,1
+            frames = images + images[-2::-1]
+        else:
+            # 4 frames: 1,2,3,4,3,2
+            # 3 frames: 1,2,3,2
+            frames = images + images[-2:0:-1]
     else:
         frames = images
     
-    # Force even dimensions (H.264 yuv420p requires even width/height).
-    # Crop by 1px if needed; avoids resampling blur.
-    frames = [_crop_to_even_dimensions(f) for f in frames]
+    if force_even_dimensions:
+        # H.264 yuv420p requires even width/height.
+        # Crop by 1px if needed; avoids resampling blur.
+        frames = [_crop_to_even_dimensions(f) for f in frames]
     return frames
 
 

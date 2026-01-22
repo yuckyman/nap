@@ -136,7 +136,6 @@ def process_single_batch(
         
         # Center images on subjects
         logger.info("  Centering images on subjects...")
-        from nimslo_core.alignment import center_images_on_subject
         centered_images, centered_masks, center_transforms = center_images_on_subject(
             preprocessed, masks
         )
@@ -167,7 +166,9 @@ def process_single_batch(
             aligned_originals,
             crop_valid_region=True,
             normalize_brightness=True,  # Prevent flashing from exposure differences
-            brightness_strength=0.5  # Moderate correction (0.0-1.0)
+            brightness_strength=0.5,  # Moderate correction (0.0-1.0)
+            end_on_first=(output_format == "mp4"),
+            force_even_dimensions=(output_format == "mp4")
         )
         
         if output_format == "gif":
