@@ -26,6 +26,15 @@ code/
 
 ## quick start
 
+### browser notebook
+
+run the browser-oriented alignment walkthrough in molab:
+
+[open `nimslo_alignment_dashboard.py` in molab](https://molab.marimo.io/https://github.com/yuckyman/nap/blob/main/notebooks/nimslo_alignment_dashboard.py)
+
+the molab notebook uses the committed lightweight sample scans in `notebooks/web-scans/`.
+keep full-resolution/private scans out of the public repo; use the local cli for those.
+
 ### single batch
 
 ```bash
