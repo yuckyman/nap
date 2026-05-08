@@ -251,6 +251,8 @@ def _(Path, SAMPLE_SCAN_GROUPS, cv2, np):
             if img is not None:
                 frames.append(img)
                 names.append(file_path.name)
+        if len(frames) < 3 and str(directory) in SAMPLE_SCAN_GROUPS:
+            return load_remote_scans(str(directory))
         return frames, names
 
     return (load_directory_scans,)
