@@ -215,12 +215,15 @@ def _(Path, SAMPLE_SCAN_GROUPS, cv2, np):
         try:
             from pyodide.http import open_url
 
-            return open_url(url).read()
+            data = open_url(url).read()
         except Exception:
             from urllib.request import urlopen
 
             with urlopen(url) as response:
-                return response.read()
+                data = response.read()
+        if isinstance(data, str):
+            data = data.encode("latin-1")
+        return data
 
     def decode_image(data):
         array = np.frombuffer(data, dtype=np.uint8)
