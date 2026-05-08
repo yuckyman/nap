@@ -602,24 +602,5 @@ def _(Image, bgr_to_rgb, boomerang_frames, io, mo):
     return
 
 
-@app.cell
-def _(mo):
-    mo.md("""
-    ## drop into hugo
-
-    save this file anywhere in your hugo content tree, then export it as static html:
-
-    ```bash
-    python -m pip install marimo opencv-python pillow matplotlib numpy
-    marimo export html nimslo_alignment_dashboard.py -o nimslo-alignment/index.html
-    ```
-
-    for the production pipeline version, swap the opencv segmentation cell for
-    `nimslo_core.segmentation.get_segmentation_mask` and the helper alignment
-    functions for `nimslo_core.alignment`; the stages here mirror that code path.
-    """)
-    return
-
-
 if __name__ == "__main__":
     app.run()
