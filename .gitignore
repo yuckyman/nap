@@ -62,4 +62,7 @@ output_mp4/
 # ~/.cache/
 
 .cursor/
-
+.marimo-config/
+notebooks/__marimo__/
+notebooks/scans/
+notebooks/nimslo-alignment.html
