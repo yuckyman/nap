@@ -4,7 +4,7 @@
 #     "marimo",
 #     "matplotlib",
 #     "numpy",
-#     "opencv-python-headless",
+#     "opencv-python",
 #     "pillow",
 # ]
 # ///
