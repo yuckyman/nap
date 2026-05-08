@@ -46,6 +46,45 @@ def _(mo):
 
 @app.cell
 def _(Path, mo):
+    SAMPLE_SCAN_GROUPS = {
+        "web-scans/44": [
+            "723594009607-R1-064-30A.jpg",
+            "723594009607-R1-065-31.jpg",
+            "723594009607-R1-066-31A.jpg",
+            "723594009607-R1-067-32.jpg",
+        ],
+        "web-scans/45": [
+            "723594009607-R1-068-32A.jpg",
+            "723594009607-R1-069-33.jpg",
+            "723594009607-R1-070-33A.jpg",
+            "723594009607-R1-071-34.jpg",
+        ],
+        "web-scans/49": [
+            "378424001385-R1-000-19A-20.jpg",
+            "378424001385-R1-000-20-20A.jpg",
+            "378424001385-R1-000-20A-21.jpg",
+            "378424001385-R1-000-21-21A.jpg",
+        ],
+        "web-scans/56": [
+            "378424001387-R1-059-28.jpg",
+            "378424001387-R1-060-28A.jpg",
+            "378424001387-R1-061-29.jpg",
+            "378424001387-R1-062-29A.jpg",
+        ],
+        "web-scans/60": [
+            "378424001385-R1-014-5A.jpg",
+            "378424001385-R1-015-6.jpg",
+            "378424001385-R1-016-6A.jpg",
+            "378424001385-R1-017-7.jpg",
+        ],
+        "web-scans/74": [
+            "213547008873-R1-025.jpg",
+            "213547008873-R1-026.jpg",
+            "213547008873-R1-027.jpg",
+            "213547008873-R1-028.jpg",
+        ],
+    }
+
     notebook_dir = Path(__file__).parent if "__file__" in globals() else Path.cwd()
     scan_root_candidates = [
         notebook_dir / "web-scans",
@@ -54,11 +93,14 @@ def _(Path, mo):
         Path("notebooks/scans"),
     ]
     scans_root = next((path for path in scan_root_candidates if path.exists()), scan_root_candidates[0])
-    scan_folders = [
-        str(path)
-        for path in sorted(scans_root.iterdir(), key=lambda p: int(p.name) if p.name.isdigit() else p.name)
-        if path.is_dir()
-    ]
+    if scans_root.exists():
+        scan_folders = [
+            str(path)
+            for path in sorted(scans_root.iterdir(), key=lambda p: int(p.name) if p.name.isdigit() else p.name)
+            if path.is_dir()
+        ]
+    else:
+        scan_folders = list(SAMPLE_SCAN_GROUPS)
     selected_folder = mo.ui.dropdown(
         options=scan_folders,
         value=scan_folders[0] if scan_folders else None,
@@ -95,6 +137,7 @@ def _(Path, mo):
     return (
         max_dimension,
         quality,
+        SAMPLE_SCAN_GROUPS,
         segmentation,
         selected_folder,
         show_features,
@@ -164,15 +207,42 @@ def _(cv2, dataclass, np):
 
 
 @app.cell
-def _(Path, cv2):
+def _(Path, SAMPLE_SCAN_GROUPS, cv2, np):
     IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+    RAW_SCAN_BASE = "https://raw.githubusercontent.com/yuckyman/nap/main/notebooks"
+
+    def fetch_bytes(url):
+        try:
+            from pyodide.http import open_url
+
+            return open_url(url).read()
+        except Exception:
+            from urllib.request import urlopen
+
+            with urlopen(url) as response:
+                return response.read()
+
+    def decode_image(data):
+        array = np.frombuffer(data, dtype=np.uint8)
+        return cv2.imdecode(array, cv2.IMREAD_COLOR)
+
+    def load_remote_scans(group):
+        frames = []
+        names = []
+        for name in SAMPLE_SCAN_GROUPS.get(group, [])[:4]:
+            url = f"{RAW_SCAN_BASE}/{group}/{name}"
+            img = decode_image(fetch_bytes(url))
+            if img is not None:
+                frames.append(img)
+                names.append(name)
+        return frames, names
 
     def load_directory_scans(directory):
         if not directory:
             return [], []
         path = Path(directory).expanduser()
         if not path.exists() or not path.is_dir():
-            return [], []
+            return load_remote_scans(str(directory))
         files = sorted(p for p in path.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
         frames = []
         names = []
