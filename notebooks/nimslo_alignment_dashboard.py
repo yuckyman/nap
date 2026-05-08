@@ -211,41 +211,39 @@ def _(Path, SAMPLE_SCAN_GROUPS, cv2, np):
     IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
     RAW_SCAN_BASE = "https://raw.githubusercontent.com/yuckyman/nap/main/notebooks"
 
-    def fetch_bytes(url):
+    async def fetch_bytes(url):
         try:
-            from pyodide.http import open_url
-
-            data = open_url(url).read()
+            from pyodide.http import pyfetch
         except Exception:
             from urllib.request import urlopen
 
             with urlopen(url) as response:
-                data = response.read()
-        if isinstance(data, str):
-            data = data.encode("latin-1")
-        return data
+                return response.read()
+        response = await pyfetch(url)
+        response.raise_for_status()
+        return await response.bytes()
 
     def decode_image(data):
         array = np.frombuffer(data, dtype=np.uint8)
         return cv2.imdecode(array, cv2.IMREAD_COLOR)
 
-    def load_remote_scans(group):
+    async def load_remote_scans(group):
         frames = []
         names = []
         for name in SAMPLE_SCAN_GROUPS.get(group, [])[:4]:
             url = f"{RAW_SCAN_BASE}/{group}/{name}"
-            img = decode_image(fetch_bytes(url))
+            img = decode_image(await fetch_bytes(url))
             if img is not None:
                 frames.append(img)
                 names.append(name)
         return frames, names
 
-    def load_directory_scans(directory):
+    async def load_directory_scans(directory):
         if not directory:
             return [], []
         path = Path(directory).expanduser()
         if not path.exists() or not path.is_dir():
-            return load_remote_scans(str(directory))
+            return await load_remote_scans(str(directory))
         files = sorted(p for p in path.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
         frames = []
         names = []
@@ -255,7 +253,7 @@ def _(Path, SAMPLE_SCAN_GROUPS, cv2, np):
                 frames.append(img)
                 names.append(file_path.name)
         if len(frames) < 3 and str(directory) in SAMPLE_SCAN_GROUPS:
-            return load_remote_scans(str(directory))
+            return await load_remote_scans(str(directory))
         return frames, names
 
     return (load_directory_scans,)
@@ -414,14 +412,14 @@ def _(cv2, np):
 
 
 @app.cell
-def _(
+async def _(
     load_directory_scans,
     max_dimension,
     mo,
     resize_for_browser,
     selected_folder,
 ):
-    full_resolution_frames, frame_names = load_directory_scans(selected_folder.value)
+    full_resolution_frames, frame_names = await load_directory_scans(selected_folder.value)
     mo.stop(
         len(full_resolution_frames) < 3,
         mo.md(
