@@ -38,7 +38,7 @@ def process_single_batch(
     quality: str = "best",
     show_masks: bool = False,
     preview: bool = False,
-    mp4_loops: Optional[int] = None
+    mp4_loops: Optional[int] = None,
 ) -> dict:
     """
     Process a single batch of 4 images.
@@ -56,7 +56,7 @@ def process_single_batch(
     import cv2
     import numpy as np
     from nimslo_core.preprocessing import preprocess_image, normalize_sizes
-    from nimslo_core.segmentation import get_segmentation_mask
+    from nimslo_core.segmentation import FAST_SEGMENTATION, segment_images
     from nimslo_core.alignment import align_images, center_images_on_subject
     from nimslo_core.gif_generator import make_boomerang_frames, encode_gif, encode_mp4, resize_for_web
     
@@ -87,7 +87,7 @@ def process_single_batch(
             image_files = image_files[:4]
         else:
             image_files = image_files[:3]
-            logger.info("  ⚠ Only 3 images found - using 1→2→3→2→1 boomerang")
+            logger.info("  ⚠ Only 3 images found - using 1→2→3→2 boomerang")
         logger.info(f"  Loading {len(image_files)} images...")
         
         images_original = []
@@ -107,13 +107,13 @@ def process_single_batch(
         preprocessed = [preprocess_image(img, denoise=settings["denoise"]) for img in images_original]
         preprocessed = normalize_sizes(preprocessed)
         
-        # Segment
+        # Segment (batched, downscaled, coreml on mac)
         logger.info("  Segmenting subjects...")
+        seg_results = segment_images(preprocessed, FAST_SEGMENTATION)
         masks = []
-        for i, img in enumerate(preprocessed):
-            mask, conf, method = get_segmentation_mask(img)
+        for i, (mask, conf) in enumerate(seg_results):
             masks.append(mask)
-            logger.info(f"    Frame {i+1}: {method} (conf: {conf:.2f})")
+            logger.info(f"    Frame {i+1}: {FAST_SEGMENTATION.model} (conf: {conf:.2f})")
         
         # Save mask visualization if requested
         if show_masks:
@@ -144,13 +144,16 @@ def process_single_batch(
         logger.info("  Aligning frames...")
         _, results = align_images(
             centered_images, centered_masks,
-            n_features=settings["n_features"]
+            n_features=settings["n_features"],
         )
         
         # Log alignment results
         for i, r in enumerate(results):
             if i > 0:  # Skip reference
-                logger.info(f"    Frame {i+1}: {r.total_matches} matches, {r.inliers} inliers, IoU: {r.iou:.2f}")
+                logger.info(
+                    f"    Frame {i+1}: {r.total_matches} matches, {r.inliers} inliers, "
+                    f"IoU: {r.iou:.2f}"
+                )
         
         # Apply the *same* transforms to the original (non-denoised) scans to preserve film grain.
         h, w = images_original[0].shape[:2]
@@ -210,7 +213,7 @@ def process_batch_directory(
     output_format: str,
     quality: str = "best",
     show_masks: bool = False,
-    mp4_loops: Optional[int] = None
+    mp4_loops: Optional[int] = None,
 ) -> List[dict]:
     """
     Process all batch directories within input_dir.
@@ -246,7 +249,7 @@ def process_batch_directory(
             output_format=output_format,
             quality=quality,
             show_masks=show_masks,
-            mp4_loops=mp4_loops
+            mp4_loops=mp4_loops,
         )
         results.append(result)
     
@@ -382,7 +385,7 @@ Examples:
             output_format=output_format,
             quality=args.quality,
             show_masks=args.show_masks,
-            mp4_loops=mp4_loops
+            mp4_loops=mp4_loops,
         )
         
         # Exit with error if any failed
@@ -406,7 +409,7 @@ Examples:
             quality=args.quality,
             show_masks=args.show_masks,
             preview=args.preview,
-            mp4_loops=(args.loops if args.loops is not None else (args.longer if args.longer is not None else None))
+            mp4_loops=(args.loops if args.loops is not None else (args.longer if args.longer is not None else None)),
         )
         
         if not result["success"]:

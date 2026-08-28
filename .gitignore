@@ -56,6 +56,18 @@ test_*.gif
 outputs/
 output/
 output_mp4/
+benchmark_output/
+profile_output/
+
+# Runtime / model caches
+.numba_cache/
+
+# Dev-only scripts and vendored experiments (keep locally, not in repo)
+benchmark_alignment.py
+benchmark_optimizations.py
+profile_pipeline.py
+smoke_test_framing.py
+external/
 
 # Model cache (optional - uncomment if you want to ignore)
 # ~/.u2net/

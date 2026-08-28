@@ -1,8 +1,8 @@
 """
 Alignment module for Nimslo images.
 
-Uses SIFT feature matching with homography estimation
-to align stereoscopic image pairs.
+Uses SIFT feature matching with affine-RANSAC inlier rejection
+and translation-only warping to align stereoscopic image pairs.
 """
 
 import cv2
@@ -19,7 +19,10 @@ class AlignmentResult:
     total_matches: int  # Total number of matches
     iou: float  # Intersection over Union of masks
     confidence: float  # Overall alignment confidence
-    
+
+
+RANSAC_MODELS = ("translation", "affine_partial", "homography")
+
 
 def extract_features(
     img: np.ndarray,
@@ -256,6 +259,163 @@ def estimate_affine(
     return M, mask
 
 
+def matched_point_arrays(
+    kp1: list,
+    kp2: list,
+    matches: List[cv2.DMatch]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract matched 2D point arrays from keypoints and matches."""
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches])
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches])
+    return src_pts, dst_pts
+
+
+def ransac_inlier_mask(
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+    model: str = "translation",
+    ransac_threshold: float = 5.0,
+    min_matches: int = 3
+) -> Optional[np.ndarray]:
+    """
+    Run RANSAC inlier rejection only; discard the estimated transform.
+
+    Args:
+        src_pts: Reference points (N, 2)
+        dst_pts: Target points (N, 2)
+        model: "translation", "affine_partial", or "homography"
+        ransac_threshold: RANSAC reprojection threshold in pixels
+        min_matches: Minimum matches required
+
+    Returns:
+        Boolean inlier mask of shape (N,) or None if RANSAC fails
+    """
+    if model not in RANSAC_MODELS:
+        raise ValueError(f"Unknown RANSAC model: {model}. Expected one of {RANSAC_MODELS}")
+
+    src_pts = np.asarray(src_pts, dtype=np.float32).reshape(-1, 2)
+    dst_pts = np.asarray(dst_pts, dtype=np.float32).reshape(-1, 2)
+    if len(src_pts) < min_matches:
+        return None
+
+    if model == "translation":
+        translations = dst_pts - src_pts
+        best_inliers = 0
+        best_mask = None
+        n_iterations = min(100, max(10, int(np.log(0.01) / np.log(0.125))))
+
+        for _ in range(n_iterations):
+            sample_size = min(max(2, len(src_pts) // 4), len(src_pts))
+            if sample_size < len(src_pts):
+                sample_indices = np.random.choice(len(src_pts), size=sample_size, replace=False)
+            else:
+                sample_indices = np.arange(len(src_pts))
+
+            sample_translations = translations[sample_indices]
+            candidate_tx = np.median(sample_translations[:, 0])
+            candidate_ty = np.median(sample_translations[:, 1])
+            predicted_dst = src_pts + np.array([candidate_tx, candidate_ty])
+            errors = np.linalg.norm(predicted_dst - dst_pts, axis=1)
+            inlier_mask = errors < ransac_threshold
+            n_inliers = int(np.sum(inlier_mask))
+
+            if n_inliers > best_inliers:
+                best_inliers = n_inliers
+                best_mask = inlier_mask
+
+        if best_mask is not None and best_inliers >= min_matches:
+            return best_mask.astype(bool)
+        return None
+
+    src_cv = src_pts.reshape(-1, 1, 2)
+    dst_cv = dst_pts.reshape(-1, 1, 2)
+
+    if model == "affine_partial":
+        if len(src_pts) < max(min_matches, 3):
+            return None
+        _, mask = cv2.estimateAffinePartial2D(
+            src_cv,
+            dst_cv,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=ransac_threshold
+        )
+    else:
+        if len(src_pts) < max(min_matches, 4):
+            return None
+        _, mask = cv2.findHomography(src_cv, dst_cv, cv2.RANSAC, ransac_threshold)
+
+    if mask is None:
+        return None
+
+    inlier_mask = mask.ravel().astype(bool)
+    if int(np.sum(inlier_mask)) < min_matches:
+        return None
+    return inlier_mask
+
+
+def fit_translation_from_points(
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+    min_matches: int = 3,
+) -> Optional[np.ndarray]:
+    """Fit a translation-only transform from matched points (centroid alignment)."""
+    src_pts = np.asarray(src_pts, dtype=np.float64).reshape(-1, 2)
+    dst_pts = np.asarray(dst_pts, dtype=np.float64).reshape(-1, 2)
+    if len(src_pts) < min_matches:
+        return None
+
+    translation = dst_pts.mean(axis=0) - src_pts.mean(axis=0)
+    return np.float32([
+        [1.0, 0.0, translation[0]],
+        [0.0, 1.0, translation[1]],
+    ])
+
+
+# Backwards-compatible alias for benchmark scripts.
+estimate_procrustes_from_points = fit_translation_from_points
+
+
+def estimate_translation_ransac(
+    kp1: list,
+    kp2: list,
+    matches: List[cv2.DMatch],
+    ransac_threshold: float = 5.0,
+    min_matches: int = 3,
+    inlier_model: str = "affine_partial",
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Estimate a translation-only transform from SIFT matches.
+
+    Uses RANSAC inlier rejection (affine partial by default) then fits
+    translation from inlier centroids. Rotation/scale from RANSAC are discarded.
+    """
+    if inlier_model == "legacy_median":
+        return estimate_translation(kp1, kp2, matches, ransac_threshold, min_matches)
+
+    if len(matches) < min_matches:
+        return None, None
+
+    src_pts, dst_pts = matched_point_arrays(kp1, kp2, matches)
+    inlier_mask = ransac_inlier_mask(
+        src_pts,
+        dst_pts,
+        model=inlier_model,
+        ransac_threshold=ransac_threshold,
+        min_matches=min_matches,
+    )
+    if inlier_mask is None or int(np.sum(inlier_mask)) < min_matches:
+        return None, None
+
+    transform = fit_translation_from_points(
+        src_pts[inlier_mask],
+        dst_pts[inlier_mask],
+        min_matches=min_matches,
+    )
+    if transform is None:
+        return None, None
+    return transform, inlier_mask.astype(np.uint8)
+
+
 def center_images_on_subject(
     images: List[np.ndarray],
     masks: List[np.ndarray],
@@ -400,41 +560,31 @@ def align_pair(
     img2: np.ndarray,
     mask1: Optional[np.ndarray] = None,
     mask2: Optional[np.ndarray] = None,
-    use_translation_only: bool = True,
     n_features: int = 1000,
     ratio_threshold: float = 0.75,
-    ransac_threshold: float = 5.0
+    ransac_threshold: float = 5.0,
+    inlier_model: str = "affine_partial",
+    min_matches: int = 3,
 ) -> Tuple[Optional[np.ndarray], AlignmentResult]:
     """
-    Align img1 to img2 using feature-based matching.
-    
-    Args:
-        img1: Source image to be warped
-        img2: Target/reference image
-        mask1: Optional mask for img1 subject region
-        mask2: Optional mask for img2 subject region
-        use_translation_only: If True, only allow translation (no rotation). 
-                             If False, use affine transformation.
-        n_features: Maximum SIFT features
-        ratio_threshold: Lowe's ratio test threshold
-        ransac_threshold: RANSAC reprojection threshold
-        
-    Returns:
-        Tuple of (warped image, AlignmentResult)
+    Align img1 to img2 using SIFT matching and translation-only warping.
+
+    RANSAC (affine partial by default) selects inlier correspondences; the final
+    warp is always translation-only to preserve the Nimslo stereo effect.
     """
-    # Extract features
     kp1, des1 = extract_features(img1, mask1, n_features)
     kp2, des2 = extract_features(img2, mask2, n_features)
-    
-    # Match features
     matches = match_features(des1, des2, ratio_threshold)
-    
-    # Estimate transformation
-    if use_translation_only:
-        transform, inlier_mask = estimate_translation(kp1, kp2, matches, ransac_threshold)
-    else:
-        transform, inlier_mask = estimate_affine(kp1, kp2, matches, ransac_threshold)
-    
+
+    transform, inlier_mask = estimate_translation_ransac(
+        kp1,
+        kp2,
+        matches,
+        ransac_threshold=ransac_threshold,
+        min_matches=min_matches,
+        inlier_model=inlier_model,
+    )
+
     if transform is None:
         result = AlignmentResult(
             transform=np.eye(3),
@@ -444,38 +594,28 @@ def align_pair(
             confidence=0.0
         )
         return None, result
-    
-    # Warp image (translation and affine both use warpAffine)
+
     h, w = img2.shape[:2]
     warped = cv2.warpAffine(img1, transform, (w, h))
-    
-    # Calculate metrics
     n_inliers = int(np.sum(inlier_mask)) if inlier_mask is not None else 0
-    
-    # Calculate IoU if masks provided
+
     if mask1 is not None and mask2 is not None:
         iou = calculate_iou(mask1, mask2, transform)
     else:
         iou = 0.0
-    
-    # Confidence based on inlier ratio and IoU
+
     inlier_ratio = n_inliers / len(matches) if matches else 0
     confidence = 0.5 * inlier_ratio + 0.5 * iou
-    
-    # Convert affine to 3x3 for consistent storage
-    if transform.shape == (2, 3):
-        full_transform = np.vstack([transform, [0, 0, 1]])
-    else:
-        full_transform = transform
-    
+    full_transform = np.vstack([transform, [0, 0, 1]])
+
     result = AlignmentResult(
         transform=full_transform,
         inliers=n_inliers,
         total_matches=len(matches),
         iou=iou,
-        confidence=confidence
+        confidence=confidence,
     )
-    
+
     return warped, result
 
 
@@ -483,56 +623,54 @@ def align_images(
     images: List[np.ndarray],
     masks: Optional[List[np.ndarray]] = None,
     reference_idx: int = 0,
-    use_translation_only: bool = True,
     **kwargs
 ) -> Tuple[List[np.ndarray], List[AlignmentResult]]:
     """
     Align multiple images to a reference image.
-    
+
     Args:
         images: List of BGR images
         masks: Optional list of masks for each image
         reference_idx: Index of reference image (default: first image)
-        use_translation_only: If True, only allow translation (no rotation)
         **kwargs: Additional arguments passed to align_pair
-        
+
     Returns:
         Tuple of (list of aligned images, list of alignment results)
     """
     if masks is None:
         masks = [None] * len(images)
-    
+
     ref_img = images[reference_idx]
     ref_mask = masks[reference_idx]
-    
+
     aligned_images = []
     results = []
-    
+
     for i, (img, mask) in enumerate(zip(images, masks)):
         if i == reference_idx:
-            # Reference image stays as-is
             aligned_images.append(img.copy())
             results.append(AlignmentResult(
                 transform=np.eye(3),
                 inliers=0,
                 total_matches=0,
                 iou=1.0,
-                confidence=1.0
+                confidence=1.0,
             ))
         else:
             warped, result = align_pair(
-                img, ref_img,
-                mask, ref_mask,
-                use_translation_only=use_translation_only,
+                img,
+                ref_img,
+                mask,
+                ref_mask,
                 **kwargs
             )
-            
+
             if warped is not None:
                 aligned_images.append(warped)
             else:
                 aligned_images.append(img.copy())
             results.append(result)
-    
+
     return aligned_images, results
 
 

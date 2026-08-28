@@ -7,42 +7,78 @@ U²-Net or bust - no fallbacks.
 
 import cv2
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Dict
 from PIL import Image
-import io
 import os
+import sys
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from pathlib import Path
 import urllib.request
 import tarfile
 import tempfile
 
-# Configure OpenMP BEFORE importing rembg/onnxruntime
-# This prevents the deprecated omp_set_nested warning
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-os.environ['OMP_NUM_THREADS'] = '1'  # Limit threads to avoid conflicts
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OMP_MAX_ACTIVE_LEVELS'] = '1'  # Use max_active_levels instead of nested
+U2NET_MEAN = (0.485, 0.456, 0.406)
+U2NET_STD = (0.229, 0.224, 0.225)
+U2NET_INPUT_SIZE = (320, 320)
 
-# Try to configure OpenMP programmatically if possible
-try:
-    import ctypes
-    # Try to set max_active_levels directly if OpenMP is available
+
+def _is_notebook_kernel() -> bool:
+    """True in Jupyter, IPython, or local marimo kernels (not CLI)."""
+    if "marimo" in sys.modules:
+        return True
+    if os.environ.get("MARIMO_APP_ROOT") or os.environ.get("MARIMO_BRANCH"):
+        return True
     try:
-        libomp = ctypes.CDLL(None)
-        if hasattr(libomp, 'omp_set_max_active_levels'):
-            libomp.omp_set_max_active_levels(1)
-    except:
+        from IPython import get_ipython
+        ip = get_ipython()
+        if ip is not None:
+            shell_name = ip.__class__.__name__
+            if shell_name in ("ZMQInteractiveShell", "GoogleColabShell", "TerminalInteractiveShell"):
+                return True
+    except ImportError:
         pass
-except:
-    pass
+    return False
 
-warnings.filterwarnings('ignore', message='.*omp_set_nested.*')
-warnings.filterwarnings('ignore', message='.*omp_set_max_active_levels.*')
+
+def configure_openmp(force_single_thread: Optional[bool] = None) -> None:
+    """
+    Limit OpenMP threads in notebook kernels to avoid onnx/jupyter crashes.
+
+    CLI runs use available CPU cores. Marimo WASM in the browser does not
+    import this module.
+    """
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    if force_single_thread is None:
+        force_single_thread = _is_notebook_kernel()
+    if force_single_thread:
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["OMP_MAX_ACTIVE_LEVELS"] = "1"
+        try:
+            import ctypes
+            libomp = ctypes.CDLL(None)
+            if hasattr(libomp, "omp_set_max_active_levels"):
+                libomp.omp_set_max_active_levels(1)
+        except Exception:
+            pass
+    else:
+        n_threads = str(os.cpu_count() or 4)
+        os.environ["OMP_NUM_THREADS"] = n_threads
+        os.environ["OPENBLAS_NUM_THREADS"] = n_threads
+        os.environ["MKL_NUM_THREADS"] = n_threads
+        os.environ["OMP_MAX_ACTIVE_LEVELS"] = "2"
+
+
+configure_openmp()
+
+warnings.filterwarnings("ignore", message=".*omp_set_nested.*")
+warnings.filterwarnings("ignore", message=".*omp_set_max_active_levels.*")
 
 # Lazy imports for heavy dependencies
-_rembg_session = None
+_rembg_sessions: Dict[Tuple[str, str], object] = {}
 _rembg_available = None
 
 # OpenCV DNN model cache
@@ -55,12 +91,32 @@ _unet_available = None
 _unet_processor = None
 
 
+@dataclass(frozen=True)
+class SegmentationOptions:
+    """Tunable segmentation path for benchmarks and production."""
+    model: str = "u2net"
+    max_dimension: Optional[int] = None
+    parallel: bool = False
+    use_coreml: bool = False
+    force_omp_single_thread: Optional[bool] = None
+
+
+# Production-fast path: u2net (not u2netp) keeps alignment/framing stable.
+FAST_SEGMENTATION = SegmentationOptions(
+    model="u2net",
+    max_dimension=1024,
+    parallel=True,
+    use_coreml=True,
+    force_omp_single_thread=False,
+)
+
+
 def _check_rembg_available():
     """Check if rembg can be imported without crashing."""
     global _rembg_available
     if _rembg_available is None:
         try:
-            import rembg
+            import rembg  # noqa: F401
             _rembg_available = True
         except Exception as e:
             _rembg_available = False
@@ -68,19 +124,104 @@ def _check_rembg_available():
     return _rembg_available
 
 
-def _get_rembg_session():
-    """Lazy-load rembg session to avoid startup overhead."""
-    global _rembg_session
-    if _rembg_session is None:
-        if not _check_rembg_available():
-            raise RuntimeError("rembg is not available - cannot perform U²-Net segmentation")
-        try:
-            from rembg import new_session
-            # u2net is the default, good balance of quality and speed
-            _rembg_session = new_session("u2net")
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize rembg session: {e}")
-    return _rembg_session
+def _session_cache_key(model: str, use_coreml: bool) -> Tuple[str, str]:
+    if use_coreml:
+        return model, "coreml"
+    return model, "cpu"
+
+
+def _get_rembg_session(model: str = "u2net", use_coreml: bool = False):
+    """Lazy-load rembg session keyed by model and execution provider."""
+    key = _session_cache_key(model, use_coreml)
+    if key in _rembg_sessions:
+        return _rembg_sessions[key]
+
+    if not _check_rembg_available():
+        raise RuntimeError("rembg is not available - cannot perform U²-Net segmentation")
+
+    try:
+        import onnxruntime as ort
+        from rembg import new_session
+
+        kwargs = {}
+        if use_coreml and "CoreMLExecutionProvider" in ort.get_available_providers():
+            kwargs["providers"] = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+
+        _rembg_sessions[key] = new_session(model, **kwargs)
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize rembg session ({model}): {e}")
+    return _rembg_sessions[key]
+
+
+def _legacy_get_rembg_session():
+    """Backwards-compatible default session accessor."""
+    return _get_rembg_session("u2net", use_coreml=False)
+
+
+def _prepare_inference_image(
+    img: np.ndarray,
+    max_dimension: Optional[int],
+) -> Tuple[Image.Image, Tuple[int, int]]:
+    """Optionally downscale, return PIL RGB and original (w, h) for mask upscale."""
+    h, w = img.shape[:2]
+    orig_size = (w, h)
+    work = img
+    if max_dimension is not None:
+        scale = min(max_dimension / max(h, w), 1.0)
+        if scale < 1.0:
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            work = cv2.resize(work, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    img_rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img_rgb), orig_size
+
+
+def _predict_mask_pil(pil_img: Image.Image, session) -> Image.Image:
+    """Run u²-net via rembg session and return grayscale mask PIL image."""
+    return session.predict(pil_img)[0]
+
+
+def _mask_pil_to_binary(mask_pil: Image.Image, orig_size: Tuple[int, int]) -> np.ndarray:
+    mask = np.array(mask_pil)
+    if mask_pil.size != orig_size:
+        mask = cv2.resize(mask, orig_size, interpolation=cv2.INTER_LINEAR)
+    _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    return binary_mask
+
+
+def segment_images(
+    images: List[np.ndarray],
+    options: Optional[SegmentationOptions] = None,
+) -> List[Tuple[np.ndarray, float]]:
+    """
+    Segment one or more frames with shared session and optional parallelism.
+
+    Note: exported u²-net onnx graphs are fixed batch=1, so ``parallel=True``
+    runs concurrent single-frame inferences on a thread-safe shared session.
+    """
+    if not images:
+        return []
+
+    opts = options or SegmentationOptions()
+    configure_openmp(opts.force_omp_single_thread)
+    session = _get_rembg_session(opts.model, opts.use_coreml)
+    prepared = [_prepare_inference_image(img, opts.max_dimension) for img in images]
+
+    if opts.parallel and len(prepared) > 1:
+        with ThreadPoolExecutor(max_workers=len(prepared)) as executor:
+            mask_pils = list(
+                executor.map(lambda item: _predict_mask_pil(item[0], session), prepared)
+            )
+    else:
+        mask_pils = [_predict_mask_pil(pil_img, session) for pil_img, _ in prepared]
+
+    results = []
+    for (_, orig_size), mask_pil in zip(prepared, mask_pils):
+        binary_mask = _mask_pil_to_binary(mask_pil, orig_size)
+        confidence = _calculate_mask_confidence(binary_mask)
+        results.append((binary_mask, confidence))
+    return results
 
 
 def segment_subject(
@@ -120,44 +261,18 @@ def segment_subject(
     return mask
 
 
-def _segment_u2net(img: np.ndarray) -> Tuple[np.ndarray, float]:
+def _segment_u2net(
+    img: np.ndarray,
+    options: Optional[SegmentationOptions] = None,
+) -> Tuple[np.ndarray, float]:
     """
     Segment using U²-Net via rembg library.
-    
+
     Returns:
         Tuple of (binary mask, confidence score)
     """
-    try:
-        from rembg import remove
-    except ImportError as e:
-        raise RuntimeError(f"rembg not available: {e}. Install with: pip install rembg onnxruntime")
-    
-    # Convert BGR to RGB for PIL
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(img_rgb)
-    
-    # Get session and remove background
-    try:
-        session = _get_rembg_session()
-    except Exception as e:
-        raise RuntimeError(f"Failed to get rembg session: {e}")
-    
-    try:
-        # Remove returns RGBA image with alpha channel as mask
-        result = remove(pil_img, session=session, only_mask=True)
-    except Exception as e:
-        raise RuntimeError(f"rembg segmentation failed: {e}")
-    
-    # Convert mask to numpy
-    mask = np.array(result)
-    
-    # Ensure binary mask
-    _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-    
-    # Calculate confidence based on mask properties
-    confidence = _calculate_mask_confidence(binary_mask)
-    
-    return binary_mask, confidence
+    mask, confidence = segment_images([img], options)[0]
+    return mask, confidence
 
 
 def _get_unet_model():
@@ -660,22 +775,25 @@ def _calculate_mask_confidence(mask: np.ndarray) -> float:
 
 
 def get_segmentation_mask(
-    img: np.ndarray
+    img: np.ndarray,
+    options: Optional[SegmentationOptions] = None,
 ) -> Tuple[np.ndarray, float, str]:
     """
     Get segmentation mask using U²-Net (via rembg).
-    
+
     Args:
         img: Input BGR image
-        
+        options: Optional segmentation tuning (model, downscale, parallel, coreml)
+
     Returns:
         Tuple of (mask, confidence, method_used)
-        
+
     Raises:
         RuntimeError: If U²-Net/rembg is not available
     """
-    mask, confidence = _segment_u2net(img)
-    return mask, confidence, "u2net"
+    opts = options or SegmentationOptions()
+    mask, confidence = _segment_u2net(img, opts)
+    return mask, confidence, opts.model
 
 
 def refine_mask_grabcut(

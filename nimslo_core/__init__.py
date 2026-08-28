@@ -6,7 +6,7 @@ Shared modules for Nimslo 4-lens camera image alignment.
 Modules:
     - preprocessing: Film grain reduction and exposure balancing
     - segmentation: U²-Net based subject detection
-    - alignment: SIFT feature matching and homography estimation
+    - alignment: SIFT feature matching and translation-only alignment
     - gif_generator: Boomerang GIF creation
 """
 

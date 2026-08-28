@@ -4,24 +4,59 @@ a python pipeline for aligning 4-lens nimslo camera photos into smooth stereosco
 
 ## what it does
 
-1. **preprocessing** - reduces film grain and normalizes exposure across frames
-2. **segmentation** - detects the main subject using u²-net (or depth-based fallback)
-3. **alignment** - uses sift feature matching to align frames, centering on the subject
-4. **render** - applies transforms to the *original scans* (keeps film grain)
-5. **export** - outputs either gif or mp4 boomerangs with cropping + brightness normalization
+1. **preprocessing** — reduces film grain and normalizes exposure across frames
+2. **segmentation** — detects the main subject using u²-net (or depth-based fallback)
+3. **centering** — translates each frame so the mask centroid aligns to the reference
+4. **alignment** — sift matching + affine-ransac inlier rejection + translation-only warp
+5. **render** — applies transforms to the *original scans* (preserves film grain)
+6. **export** — boomerang gif or mp4 with crop + brightness normalization
+
+## architecture
+
+```
+┌─────────────┐   ┌──────────────┐   ┌─────────────────┐
+│ 4 scans     │──▶│ preprocess   │──▶│ u²-net segment  │
+│ (jpg)       │   │ denoise/exp  │   │ + mask centroid │
+└─────────────┘   └──────────────┘   └────────┬────────┘
+                                               │
+                    ┌──────────────────────────▼──────────────────────────┐
+                    │              per-frame pair (→ ref frame 1)         │
+                    │  sift (masked) → flann + lowe 0.75                   │
+                    │  → affine_partial ransac (inliers only)               │
+                    │  → centroid translation fit (0° rotation)           │
+                    └──────────────────────────┬──────────────────────────┘
+                                               │
+                    ┌──────────────────────────▼──────────────────────────┐
+                    │  warp originals → boomerang → gif/mp4                   │
+                    └───────────────────────────────────────────────────────┘
+```
+
+### alignment design
+
+the final warp is **always translation-only** — nimslo lenses are fixed horizontally and rotation would break the stereo effect. the trick is using a **looser ransac model for inlier voting** (affine partial: translation + rotation + uniform scale) while **discarding** the rotation/scale from the estimated transform. this handles depth parallax during correspondence filtering without rotating the output.
+
+confidence score: `0.5 × inlier_ratio + 0.5 × mask_iou`
+
+see `notes.md` for the aug 2026 benchmark that validated this approach.
 
 ## structure
 
 ```
-code/
-├── nimslo_cli.py          # main command-line interface
-├── nimslo_visualize.py    # pipeline with matplotlib visualizations
-├── nimslo_core/           # core library modules
-│   ├── preprocessing.py   # film grain reduction, exposure balancing
-│   ├── segmentation.py    # u²-net subject detection
-│   ├── alignment.py       # sift matching, homography estimation
-│   └── gif_generator.py   # boomerang gif creation
-└── notes.md               # development notes & troubleshooting
+nap/
+├── nimslo_cli.py              # main cli
+├── nimslo_visualize.py        # pipeline + matplotlib debug output
+├── notes.md                   # experiment log (tracked)
+├── benchmark_output/          # gitignored — csv/gif benchmark artifacts
+├── profile_output/            # gitignored — profiler csv output
+├── nimslo_core/
+│   ├── preprocessing.py       # film grain reduction, exposure balancing
+│   ├── segmentation.py        # u²-net subject detection
+│   ├── alignment.py           # sift matching, affine-ransac, translation warp
+│   ├── gif_generator.py       # boomerang frame order + gif/mp4 encode
+│   └── rectification.py       # stereo rectification utilities
+├── notebooks/
+│   └── nimslo_alignment_dashboard.py   # molab walkthrough
+└── notes.md                   # development notes & experiment log
 ```
 
 ## quick start
@@ -71,7 +106,17 @@ options:
   --show-masks          save segmentation mask visualization
   --preview             open result after processing (single mode only)
   -v, --verbose         enable verbose output
+  --loops / --longer N  mp4 only: repeat boomerang sequence N times
 ```
+
+### boomerang frame order
+
+| format | sequence | why |
+|---|---|---|
+| **gif** | `1→2→3→4→3→2` | loops `2→1` cleanly, no duplicate hold |
+| **mp4** | `1→2→3→4→3→2→1` | ends on frame 1 for seamless concatenation |
+
+3-frame fallback (mechanical failure): `1→2→3→2`
 
 ### mp4 defaults (high fidelity / film grain friendly)
 
@@ -80,109 +125,128 @@ mp4 export uses `ffmpeg` + `libx264` and is tuned to preserve grain:
 - **fps**: 10
 - **loops**: 1 (default). use `--longer N` (or `--loops N`) to concatenate more loops.
 - **tune**: grain
-- **crf**: 18 (good quality / reasonable size)
+- **crf**: 18
 - **even dimensions**: enforced via 1px crop when needed (no resampling blur)
 - **edge crop**: removes warp borders by intersecting valid regions across frames
 
-### 3-frame fallback
-
-if a batch only has 3 scans (mechanical failure / dev issues), the cli will still run and the boomerang becomes:
-
-- **3 frames**: 1→2→3→2→1
-- **4 frames**: 1→2→3→4→3→2→1
-
 ### quality presets
 
-- **fast**: 500 features, 400px max, no denoising
-- **balanced**: 1000 features, 600px max, denoising enabled (default)
-- **best**: 2000 features, 800px max, denoising enabled
+| preset | sift features | max dimension | denoise |
+|---|---|---|---|
+| fast | 500 | 400px | no |
+| balanced | 1000 | 600px | yes |
+| best | 2000 | 800px | yes |
 
 ## core modules
 
 ### `preprocessing.py`
 
-handles image preprocessing:
-- `preprocess_image()` - main preprocessing pipeline
-- `denoise_film_grain()` - pyramid mean shift filtering
-- `balance_exposure()` - histogram equalization
-- `normalize_sizes()` - ensures all images are same dimensions
+- `preprocess_image()` — denoise + exposure balance
+- `normalize_sizes()` — match dimensions across frames
 
 ### `segmentation.py`
 
-subject detection with multiple fallback methods:
-- **u²-net** (primary) - deep learning segmentation via rembg
-- **depth-based** (fallback) - intel dpt depth estimation
-- **grabcut** (refinement) - opencv-based refinement
+subject detection with fallback chain:
 
-exports: `get_segmentation_mask()` - returns mask, confidence, method used
+1. **u²-net** (primary) — rembg/onnxruntime
+2. **depth-based** — intel dpt
+3. **grabcut** — opencv refinement
+
+exports: `get_segmentation_mask()` → `(mask, confidence, method)`
 
 ### `alignment.py`
 
-feature matching and image alignment:
-- `extract_features()` - sift/orb feature extraction
-- `match_features()` - feature matching with ratio test
-- `align_images()` - full alignment pipeline with iou optimization
-- `center_images_on_subject()` - centers images on detected subject
+key functions:
 
-uses homography estimation to warp images into alignment, optimizing for intersection-over-union (iou) of the segmented subject.
+| function | role |
+|---|---|
+| `extract_features()` | sift inside subject mask |
+| `match_features()` | flann + lowe ratio test (0.75) |
+| `ransac_inlier_mask()` | ransac inlier rejection (production: `affine_partial`) |
+| `fit_translation_from_points()` | centroid translation on inliers |
+| `estimate_translation_ransac()` | ransac + translation fit (single entry point) |
+| `align_pair()` / `align_images()` | full per-pair / multi-frame alignment |
+| `center_images_on_subject()` | mask-centroid pre-alignment |
 
 ### `gif_generator.py`
 
-boomerang gif creation:
-- `create_boomerang_gif()` - main gif generation
-- `resize_for_web()` - resizes images for reasonable file sizes
-- `_crop_to_valid_region()` - removes black borders from warped images
-- `_normalize_brightness()` - prevents flashing from exposure differences
+- `make_boomerang_frames()` — forward + reverse frame sequence
+- `encode_gif()` / `encode_mp4()` — export with grain-friendly settings
+- `_crop_to_valid_region()` — removes black warp borders
+- `_normalize_brightness()` — prevents exposure flashing between frames
 
-creates the classic boomerang pattern: forward (1→2→3→4) then reverse (4→3→2→1).
+## benchmarking
+
+dev scripts (`benchmark_alignment.py`, `benchmark_optimizations.py`, `profile_pipeline.py`, `smoke_test_framing.py`) are gitignored — keep them locally for sweeps. outputs go to `benchmark_output/` and `profile_output/` (also gitignored).
+
+compare alignment variants on real rolls:
+
+```bash
+python benchmark_alignment.py \
+  --input ~/path/to/nimslo \
+  --output benchmark_output \
+  --write-gifs --limit 12 --stride 7
+```
+
+writes `benchmark_output/alignment_benchmark.csv` and optional gifs per variant.
+
+### pipeline profiling
+
+quantify where wall time goes (segmentation substeps, alignment, export):
+
+```bash
+python profile_pipeline.py ./nimslo_raw/61/
+python profile_pipeline.py --input ~/path/to/nimslo --limit 5
+python profile_pipeline.py ./batch/ --segmentation-only --runs 3
+```
+
+writes `profile_output/pipeline_profile.csv`.
 
 ## dependencies
 
-see `requirements.txt` in parent directory. key deps:
-- `opencv-python` - image processing
-- `numpy<2.0` - array operations (numpy 2.x breaks onnxruntime)
-- `rembg` + `onnxruntime` - u²-net segmentation
-- `pillow` - image i/o
-- `matplotlib` - visualizations (optional)
-- `ffmpeg` - required for mp4 export
+see `requirements.txt`. key deps:
+
+- `opencv-python` — image processing, sift, ransac
+- `numpy<2.0` — onnxruntime compatibility
+- `rembg` + `onnxruntime` — u²-net segmentation
+- `pillow` — gif encoding
+- `matplotlib` — visualizations (optional)
+- `ffmpeg` — mp4 export
 
 ## known issues
 
 ### jupyter kernel crashes
 
-⚠️ **rembg/onnxruntime causes jupyter kernel crashes** on macos due to openmp conflicts. 
+rembg/onnxruntime causes jupyter kernel crashes on macos (openmp conflicts). use the cli instead:
 
-**workaround**: use the cli instead of notebooks:
 ```bash
 python nimslo_cli.py ./nimslo_raw/01/ -o output.gif
 ```
 
-the cli works perfectly because it runs in a regular python process, not a jupyter kernel.
-
 ### numpy 2.x incompatibility
 
-onnxruntime (used by rembg) isn't fully compatible with numpy 2.x yet. requirements.txt constrains to `numpy<2.0`.
+onnxruntime isn't fully compatible with numpy 2.x. requirements constrain to `numpy<2.0`.
 
 ## development notes
 
-see `notes.md` for detailed troubleshooting, test results, and development history.
+see [`notes.md`](notes.md) for experiment logs, benchmark results, and troubleshooting.
 
 ## examples
 
 ```bash
-# process a single batch with best quality
+# single batch, best quality, preview
 python nimslo_cli.py ./nimslo_raw/01/ -o my_photo.gif -q best --preview
 
-# batch process with mask visualizations
+# batch with mask debug images
 python nimslo_cli.py ./nimslo_raw/ --batch -o ./outputs/ --show-masks
 
-# generate visualizations for debugging
+# alignment debug visualizations
 python nimslo_visualize.py ./nimslo_raw/01/ -o output.gif --viz-dir ./debug_viz/
 ```
 
 the pipeline automatically handles:
+
 - different image sizes (normalizes to smallest)
 - exposure differences (brightness normalization)
 - black borders from warping (auto-cropping)
-- subject centering (aligns on detected subject)
-
+- subject centering (mask-centroid alignment before sift)

@@ -19,7 +19,7 @@ def make_boomerang_frames(
     crop_valid_region: bool = True,
     normalize_brightness: bool = True,
     brightness_strength: float = 0.5,
-    end_on_first: bool = True,
+    end_on_first: bool = False,
     force_even_dimensions: bool = False
 ) -> List[np.ndarray]:
     """
@@ -58,8 +58,13 @@ def make_boomerang_frames(
             # 4 frames: 1,2,3,4,3,2
             # 3 frames: 1,2,3,2
             frames = images + images[-2:0:-1]
+            # GIF loops back to frame 1; never end on the same frame we start on.
+            if np.array_equal(frames[0], frames[-1]):
+                frames = frames[:-1]
     else:
         frames = images
+
+    frames = _drop_consecutive_duplicate_frames(frames)
     
     if force_even_dimensions:
         # H.264 yuv420p requires even width/height.
@@ -76,6 +81,19 @@ def _crop_to_even_dimensions(img: np.ndarray) -> np.ndarray:
     if new_w == w and new_h == h:
         return img
     return img[:new_h, :new_w]
+
+
+def _drop_consecutive_duplicate_frames(frames: List[np.ndarray]) -> List[np.ndarray]:
+    """Remove back-to-back identical frames that create visible holds in GIF loops."""
+    if len(frames) < 2:
+        return frames
+
+    deduped = [frames[0]]
+    for frame in frames[1:]:
+        if np.array_equal(frame, deduped[-1]):
+            continue
+        deduped.append(frame)
+    return deduped
 
 
 def encode_gif(
@@ -100,6 +118,8 @@ def encode_gif(
     """
     if not frames:
         raise ValueError("No frames provided")
+
+    frames = _drop_consecutive_duplicate_frames(frames)
     
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,7 +127,9 @@ def encode_gif(
     pil_frames = []
     for frame in frames:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_frames.append(Image.fromarray(rgb))
+        pil_image = Image.fromarray(rgb)
+        pil_image.info["disposal"] = 2
+        pil_frames.append(pil_image)
     
     pil_frames[0].save(
         output_path,
@@ -272,7 +294,8 @@ def create_boomerang_gif(
         images,
         crop_valid_region=crop_valid_region,
         normalize_brightness=normalize_brightness,
-        brightness_strength=brightness_strength
+        brightness_strength=brightness_strength,
+        end_on_first=False,
     )
     return encode_gif(frames, output_path, duration=duration, loop=loop, optimize=optimize)
 
@@ -419,75 +442,106 @@ def _crop_based_on_transforms(images: List[np.ndarray], transforms: List[np.ndar
     return cropped
 
 
+def _valid_region_mask(
+    img: np.ndarray,
+    threshold: int = 20,
+) -> np.ndarray:
+    """Binary mask for the main non-border region of a warped frame."""
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    valid = (gray > threshold).astype(np.uint8)
+
+    num_labels, labels = cv2.connectedComponents(valid, connectivity=8)
+    if num_labels <= 1:
+        return valid * 255
+
+    cy, cx = h // 2, w // 2
+    center_label = labels[cy, cx]
+    if center_label != 0:
+        keep_label = int(center_label)
+    else:
+        counts = np.bincount(labels.reshape(-1))
+        counts[0] = 0
+        keep_label = int(np.argmax(counts))
+
+    return (labels == keep_label).astype(np.uint8) * 255
+
+
+def _mask_bbox(
+    mask: np.ndarray,
+    margin: int,
+    width: int,
+    height: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    coords = cv2.findNonZero(mask)
+    if coords is None:
+        return None
+    x, y, cw, ch = cv2.boundingRect(coords)
+    x0 = max(0, x - margin)
+    y0 = max(0, y - margin)
+    x1 = min(width, x + cw + margin)
+    y1 = min(height, y + ch + margin)
+    return x0, y0, x1, y1
+
+
 def _crop_to_valid_region(
     images: List[np.ndarray],
     threshold: int = 20,
     margin: int = 2,
-    erode_px: int = 2
+    erode_px: int = 2,
+    reference_guard: bool = False,
+    reference_guard_ratio: float = 0.97,
 ) -> List[np.ndarray]:
     """
     Crop all images to the common valid (non-border) region.
-    
+
     Robust against thin black strips along entire edges after warping:
     - build a valid mask per frame (gray > threshold)
     - keep only the main connected component (center-connected / largest)
     - AND masks across frames so any border in any frame is removed
     - erode slightly to remove residual edge pixels
-    
+    - optional reference_guard (off by default): if intersection crop is much
+      tighter than the reference frame bbox, keep the looser reference crop.
+      only useful for u2netp; causes visible black bars when alignment is good.
+
     Returns original images if no safe crop found.
     """
     if not images:
         return images
-    
+
     h, w = images[0].shape[:2]
     if any(img.shape[:2] != (h, w) for img in images):
         return images
-    
-    cy, cx = h // 2, w // 2
-    masks: List[np.ndarray] = []
-    
-    for img in images:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        valid = (gray > threshold).astype(np.uint8)
-        
-        num_labels, labels = cv2.connectedComponents(valid, connectivity=8)
-        if num_labels <= 1:
-            masks.append(valid * 255)
-            continue
-        
-        center_label = labels[cy, cx]
-        if center_label != 0:
-            keep_label = int(center_label)
-        else:
-            counts = np.bincount(labels.reshape(-1))
-            counts[0] = 0
-            keep_label = int(np.argmax(counts))
-        
-        main = (labels == keep_label).astype(np.uint8) * 255
-        masks.append(main)
-    
+
+    masks = [_valid_region_mask(img, threshold) for img in images]
+
     combined = masks[0].copy()
-    for m in masks[1:]:
-        combined = cv2.bitwise_and(combined, m)
-    
+    for mask in masks[1:]:
+        combined = cv2.bitwise_and(combined, mask)
+
     if erode_px > 0:
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * erode_px + 1, 2 * erode_px + 1))
         combined = cv2.erode(combined, k, iterations=1)
-    
-    coords = cv2.findNonZero(combined)
-    if coords is None:
+
+    intersection_bbox = _mask_bbox(combined, margin, w, h)
+    if intersection_bbox is None:
         return images
-    
-    x, y, cw, ch = cv2.boundingRect(coords)
-    x0 = max(0, x - margin)
-    y0 = max(0, y - margin)
-    x1 = min(w, x + cw + margin)
-    y1 = min(h, y + ch + margin)
-    
+
+    x0, y0, x1, y1 = intersection_bbox
+    if reference_guard:
+        ref_bbox = _mask_bbox(masks[0], margin, w, h)
+        if ref_bbox is not None:
+            ix0, iy0, ix1, iy1 = intersection_bbox
+            rx0, ry0, rx1, ry1 = ref_bbox
+            inter_area = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+            ref_area = max(0, rx1 - rx0) * max(0, ry1 - ry0)
+            if ref_area > 0 and inter_area < reference_guard_ratio * ref_area:
+                x0, y0, x1, y1 = ref_bbox
+
     # Safety: don't crop too aggressively
     if (x1 - x0) < int(w * 0.5) or (y1 - y0) < int(h * 0.5):
         return images
-    
+
     return [img[y0:y1, x0:x1] for img in images]
 
 
