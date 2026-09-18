@@ -78,6 +78,16 @@ def configured_range_paths() -> tuple[Path, Path, Path]:
     )
 
 
+def resolve_numbered_batch(input_dir: Path, number: int) -> Path:
+    """Resolve a numeric batch while supporting padded and unpadded folders."""
+    candidates = [
+        input_dir / str(number),
+        input_dir / f"{number:02d}",
+        input_dir / f"{number:03d}",
+    ]
+    return next((path for path in candidates if path.is_dir()), candidates[0])
+
+
 def process_single_batch(
     batch_path: Path,
     output_path: Path,
@@ -314,9 +324,7 @@ def process_batch_range(
     results = []
 
     for number in range(start, end + 1):
-        # Existing folders use both 01..09 and 10..137 naming conventions.
-        candidates = [input_dir / str(number), input_dir / f"{number:02d}", input_dir / f"{number:03d}"]
-        batch_path = next((path for path in candidates if path.is_dir()), candidates[0])
+        batch_path = resolve_numbered_batch(input_dir, number)
         # Preserve the user's numeric spelling for output names (01 stays 01).
         name = batch_path.name if batch_path.is_dir() else str(number)
         logger.info(f"\n[{number - start + 1}/{end - start + 1}] Processing batch {name}...")
@@ -523,6 +531,28 @@ Examples:
     if args.interactive and (args.batch or args.end is not None):
         logger.error("--interactive currently supports one batch at a time")
         sys.exit(2)
+
+    numeric_interactive = args.interactive and args.end is None and args.input.isdigit()
+    numeric_interactive_paths = None
+    if numeric_interactive:
+        if args.output is not None or args.format is not None:
+            logger.error(
+                "`nap --interactive NUMBER` writes both configured outputs; "
+                "omit --output and --format"
+            )
+            sys.exit(2)
+        try:
+            input_root, gif_root, mp4_root = configured_range_paths()
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(2)
+        batch_path = resolve_numbered_batch(input_root, int(args.input))
+        numeric_interactive_paths = (
+            batch_path,
+            gif_root / batch_path.name,
+            mp4_root / batch_path.name,
+        )
+
     if args.end is not None:
         try:
             start = int(args.input)
@@ -560,7 +590,11 @@ Examples:
             sys.exit(1)
         return
 
-    args.input = Path(args.input)
+    args.input = (
+        numeric_interactive_paths[0]
+        if numeric_interactive_paths is not None
+        else Path(args.input)
+    )
     # Validate input
     if not args.input.exists():
         logger.error(f"Input path does not exist: {args.input}")
@@ -596,10 +630,17 @@ Examples:
             sys.exit(1)
     else:
         # Single batch mode
-        output_path = args.output
-        output_format = resolve_output_format(output_path)
-        if output_path is None:
-            output_path = args.input.parent / f"{args.input.name}_aligned.{output_format}"
+        if numeric_interactive_paths is not None:
+            _, output_path, mp4_output_path = numeric_interactive_paths
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            mp4_output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_format = "both"
+        else:
+            output_path = args.output
+            output_format = resolve_output_format(output_path)
+            mp4_output_path = None
+            if output_path is None:
+                output_path = args.input.parent / f"{args.input.name}_aligned.{output_format}"
         
         if output_path.is_dir():
             output_path = output_path / f"{args.input.name}.{output_format}"
@@ -614,6 +655,7 @@ Examples:
             interactive=args.interactive,
             preview=args.preview,
             mp4_loops=(args.loops if args.loops is not None else (args.longer if args.longer is not None else None)),
+            mp4_output_path=mp4_output_path,
         )
         
         if not result["success"]:

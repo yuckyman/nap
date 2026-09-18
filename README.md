@@ -123,8 +123,13 @@ For a batch where automatic segmentation selects the wrong subject, use the
 terminal-native picker:
 
 ```bash
-python nimslo_cli.py ./nimslo_raw/134/ --interactive -o 134.gif
+nap --interactive 132
 ```
+
+With a numeric batch, the CLI resolves its folder under `NAP_INPUT_DIR` and
+writes both outputs to `NAP_GIF_OUTPUT_DIR/132.gif` and
+`NAP_MP4_OUTPUT_DIR/132.mp4`. For an arbitrary path or custom output, use the
+long form: `python nimslo_cli.py ./scans/132 --interactive -o 132.gif`.
 
 The picker uses the Kitty graphics protocol and pixel mouse reporting, both
 supported by Ghostty. Click the subject in frame 1. The picker tracks a local
