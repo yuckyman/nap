@@ -82,6 +82,25 @@ python nimslo_cli.py ./nimslo_raw/01/ -o output.gif
 python nimslo_cli.py ./nimslo_raw/ --batch -o ./outputs/
 ```
 
+### Nimslo range shortcut (`nap START END`)
+
+The `nap` shell alias accepts an inclusive batch-number range. It always uses the
+local Nimslo source directory and the `best` preset, then writes both formats
+from the same alignment run:
+
+```bash
+nap 20 137
+```
+
+Outputs are written as:
+
+- GIF: `~/path/to/wigglegrams/20.gif`
+- MP4: `~/path/to/wigglegrams/output_mp4/20.mp4`
+
+Replace `20` with each batch number in the requested range. Existing output
+files are overwritten. Use `--longer N` if the MP4 should repeat its boomerang
+sequence more than once.
+
 ### with visualizations
 
 ```bash
@@ -93,14 +112,21 @@ python nimslo_visualize.py ./nimslo_raw/01/ -o output.gif --viz-dir ./viz/
 ### cli options
 
 ```bash
-python nimslo_cli.py INPUT [-o OUTPUT] [OPTIONS]
+python nimslo_cli.py INPUT [END] [-o OUTPUT] [OPTIONS]
 
 positional:
-  INPUT                 path to batch directory (4 images) or parent dir (with --batch)
+  INPUT                 path to one batch, parent dir (with --batch), or first batch number
+  END                   inclusive final batch number; enables `nap START END` range mode
 
 options:
   -o, --output PATH     output path (file for single, directory for batch)
   --batch               process all subdirectories as batches
+
+range mode:
+  `nap START END` always uses best quality and writes both a GIF and MP4 for each
+  existing numbered batch. GIFs are written to
+  `~/path/to/wigglegrams/`; MP4s are written to
+  `~/path/to/wigglegrams/output_mp4/`.
   -q, --quality         quality preset: fast, balanced (default), best
   --format              output format: gif or mp4 (otherwise inferred from -o)
   --show-masks          save segmentation mask visualization

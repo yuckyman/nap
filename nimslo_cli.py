@@ -39,6 +39,7 @@ def process_single_batch(
     show_masks: bool = False,
     preview: bool = False,
     mp4_loops: Optional[int] = None,
+    mp4_output_path: Optional[Path] = None,
 ) -> dict:
     """
     Process a single batch of 4 images.
@@ -76,8 +77,11 @@ def process_single_batch(
     }
     
     try:
-        # Find and load images
-        image_files = sorted(batch_path.glob("*.jpg")) + sorted(batch_path.glob("*.JPG"))
+        # Find and load source scans. Keep ordering stable across all exports.
+        image_files = sorted(
+            f for f in batch_path.iterdir()
+            if f.is_file() and f.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+        ) if batch_path.is_dir() else []
         if len(image_files) < 3:
             result["error"] = f"Need at least 3 images, found {len(image_files)}"
             return result
@@ -163,37 +167,55 @@ def process_single_batch(
             warped = cv2.warpPerspective(img_orig, combined_T, (w, h))
             aligned_originals.append(warped)
         
-        # Build boomerang frames from grain-preserving aligned originals
+        # Build both exports from the same aligned originals. This keeps GIF and
+        # MP4 settings consistent while avoiding a second expensive alignment run.
         logger.info("  Building boomerang frames...")
-        boomerang_frames = make_boomerang_frames(
+        gif_frames = make_boomerang_frames(
             aligned_originals,
             crop_valid_region=True,
-            normalize_brightness=True,  # Prevent flashing from exposure differences
-            brightness_strength=0.5,  # Moderate correction (0.0-1.0)
-            end_on_first=(output_format == "mp4"),
-            force_even_dimensions=(output_format == "mp4")
+            normalize_brightness=True,
+            brightness_strength=0.5,
+            end_on_first=False,
+            force_even_dimensions=False,
         )
-        
-        if output_format == "gif":
+
+        output_paths = {}
+        if output_format in {"gif", "both"}:
             logger.info("  Generating GIF...")
-            web_frames = resize_for_web(boomerang_frames, max_dimension=settings["max_dimension"])
-            output_path = output_path.with_suffix(".gif")
-            output_path = encode_gif(web_frames, output_path)
-        elif output_format == "mp4":
+            web_frames = resize_for_web(gif_frames, max_dimension=settings["max_dimension"])
+            gif_path = output_path.with_suffix(".gif")
+            output_paths["gif"] = encode_gif(web_frames, gif_path)
+
+        if output_format in {"mp4", "both"}:
             logger.info("  Generating MP4...")
-            output_path = output_path.with_suffix(".mp4")
-            # Default: make MP4 longer by repeating the boomerang sequence.
-            # Use grain-preserving encoder settings by default.
-            output_path = encode_mp4(boomerang_frames, output_path, loops=mp4_loops if mp4_loops is not None else 1)
-        else:
+            # MP4 ends on frame 1 for seamless concatenation. Rebuild only the
+            # frame order; alignment, crop, and brightness settings are shared.
+            mp4_frames = make_boomerang_frames(
+                aligned_originals,
+                crop_valid_region=True,
+                normalize_brightness=True,
+                brightness_strength=0.5,
+                end_on_first=True,
+                force_even_dimensions=True,
+            )
+            mp4_path = (mp4_output_path or output_path).with_suffix(".mp4")
+            output_paths["mp4"] = encode_mp4(
+                mp4_frames,
+                mp4_path,
+                loops=mp4_loops if mp4_loops is not None else 1,
+            )
+
+        if not output_paths:
             raise ValueError(f"Unsupported format: {output_format}")
-        
+
         result["success"] = True
-        result["output_path"] = output_path
-        result["size_kb"] = output_path.stat().st_size / 1024
+        result["output_path"] = output_paths.get("gif") or output_paths.get("mp4")
+        result["output_paths"] = output_paths
+        result["size_kb"] = sum(path.stat().st_size for path in output_paths.values()) / 1024
         result["avg_iou"] = np.mean([r.iou for r in results[1:]])
-        
-        logger.info(f"  ✓ Saved: {output_path} ({result['size_kb']:.1f} KB)")
+
+        for kind, path in output_paths.items():
+            logger.info(f"  ✓ Saved {kind.upper()}: {path} ({path.stat().st_size / 1024:.1f} KB)")
         
         # Preview if requested
         if preview:
@@ -205,6 +227,59 @@ def process_single_batch(
         logger.error(f"  ✗ Error: {e}")
     
     return result
+
+
+def process_batch_range(
+    start: int,
+    end: int,
+    input_dir: Path,
+    gif_output_dir: Path,
+    mp4_output_dir: Path,
+    quality: str = "best",
+    show_masks: bool = False,
+    mp4_loops: Optional[int] = None,
+) -> List[dict]:
+    """Generate one GIF and one MP4 for every numbered batch in an inclusive range."""
+    if start < 0 or end < 0:
+        raise ValueError("Batch numbers must be non-negative")
+    if start > end:
+        raise ValueError("The first batch number must be less than or equal to the second")
+
+    gif_output_dir.mkdir(parents=True, exist_ok=True)
+    mp4_output_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+
+    for number in range(start, end + 1):
+        # Existing folders use both 01..09 and 10..137 naming conventions.
+        candidates = [input_dir / str(number), input_dir / f"{number:02d}", input_dir / f"{number:03d}"]
+        batch_path = next((path for path in candidates if path.is_dir()), candidates[0])
+        # Preserve the user's numeric spelling for output names (01 stays 01).
+        name = batch_path.name if batch_path.is_dir() else str(number)
+        logger.info(f"\n[{number - start + 1}/{end - start + 1}] Processing batch {name}...")
+        result = process_single_batch(
+            batch_path,
+            gif_output_dir / name,
+            output_format="both",
+            quality=quality,
+            show_masks=show_masks,
+            mp4_loops=mp4_loops,
+            mp4_output_path=mp4_output_dir / name,
+        )
+        result["batch_number"] = number
+        if not batch_path.is_dir():
+            result["error"] = f"Batch directory not found: {batch_path}"
+            result["success"] = False
+        results.append(result)
+
+    successful = [r for r in results if r["success"]]
+    failed = [r for r in results if not r["success"]]
+    logger.info(f"\n{'=' * 50}\nRange processing complete\n{'=' * 50}")
+    logger.info(f"Successful: {len(successful)}/{len(results)}")
+    if failed:
+        logger.info("Failed batches:")
+        for result in failed:
+            logger.info(f"  - {result.get('batch', result.get('batch_number'))}: {result['error']}")
+    return results
 
 
 def process_batch_directory(
@@ -291,8 +366,14 @@ Examples:
     
     parser.add_argument(
         "input",
-        type=Path,
-        help="Path to batch directory (4 images) or parent directory (with --batch)"
+        help="Batch directory, parent directory, or first batch number in range mode"
+    )
+
+    parser.add_argument(
+        "end",
+        type=int,
+        nargs="?",
+        help="Inclusive final batch number; enables `nap START END` range mode"
     )
     
     parser.add_argument(
@@ -356,13 +437,55 @@ Examples:
     
     args = parser.parse_args()
     
+    # Set up imports
+    setup_path()
+
+    # `nap START END` is the convenient range command. It intentionally uses
+    # fixed project paths so every batch gets the same best-quality treatment.
+    if args.batch and args.end is not None:
+        logger.error("Use either `--batch` or range mode (`nap START END`), not both")
+        sys.exit(2)
+    if args.end is not None:
+        try:
+            start = int(args.input)
+        except ValueError:
+            logger.error("Range mode requires numeric batch numbers: nap START END")
+            sys.exit(2)
+
+        input_root = Path.home() / "path/to/nimslo"
+        gif_root = Path.home() / "path/to/wigglegrams"
+        mp4_root = gif_root / "output_mp4"
+        if not input_root.is_dir():
+            logger.error(f"Nimslo input directory does not exist: {input_root}")
+            sys.exit(1)
+
+        if args.show_masks:
+            logger.warning("--show-masks is ignored in range mode to keep the output directories clean")
+
+        try:
+            results = process_batch_range(
+                start,
+                args.end,
+                input_root,
+                gif_root,
+                mp4_root,
+                quality="best",
+                show_masks=False,
+                mp4_loops=args.loops if args.loops is not None else args.longer,
+            )
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(2)
+        if any(not result["success"] for result in results):
+            sys.exit(1)
+        return
+
+    args.input = Path(args.input)
     # Validate input
     if not args.input.exists():
         logger.error(f"Input path does not exist: {args.input}")
         sys.exit(1)
     
-    # Set up imports
-    setup_path()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
