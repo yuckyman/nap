@@ -7,7 +7,7 @@ and translation-only warping to align stereoscopic image pairs.
 
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence
 from dataclasses import dataclass
 
 
@@ -419,7 +419,8 @@ def estimate_translation_ransac(
 def center_images_on_subject(
     images: List[np.ndarray],
     masks: List[np.ndarray],
-    target_center: Optional[Tuple[int, int]] = None
+    target_center: Optional[Tuple[int, int]] = None,
+    subject_centers: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
     """
     Center all images on their detected subjects.
@@ -431,6 +432,8 @@ def center_images_on_subject(
         images: List of BGR images
         masks: List of binary masks (255 for subject, 0 for background)
         target_center: Target center point (cx, cy). If None, uses center of first image.
+        subject_centers: Optional explicit per-frame centers, such as corrected
+            interactive anchors. Mask centroids are used when omitted.
         
     Returns:
         Tuple of (centered_images, centered_masks, translation_matrices)
@@ -438,6 +441,8 @@ def center_images_on_subject(
     """
     if len(images) != len(masks):
         raise ValueError("images and masks must have same length")
+    if subject_centers is not None and len(images) != len(subject_centers):
+        raise ValueError("images and subject_centers must have same length")
     
     if not images:
         return [], [], []
@@ -450,15 +455,18 @@ def center_images_on_subject(
     centered_masks = []
     translations = []
     
-    for img, mask in zip(images, masks):
-        # Find mask centroid
-        M = cv2.moments(mask)
-        if M["m00"] == 0:
-            # No subject detected, use image center (no translation needed)
-            cx, cy = w // 2, h // 2
+    for index, (img, mask) in enumerate(zip(images, masks)):
+        if subject_centers is not None:
+            cx, cy = subject_centers[index]
         else:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
+            # Find mask centroid
+            moments = cv2.moments(mask)
+            if moments["m00"] == 0:
+                # No subject detected, use image center (no translation needed)
+                cx, cy = w // 2, h // 2
+            else:
+                cx = moments["m10"] / moments["m00"]
+                cy = moments["m01"] / moments["m00"]
         
         # Calculate translation needed
         dx = target_center[0] - cx

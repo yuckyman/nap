@@ -84,28 +84,57 @@ python nimslo_cli.py ./nimslo_raw/ --batch -o ./outputs/
 
 ### Nimslo range shortcut (`nap START END`)
 
-The `nap` shell alias accepts an inclusive batch-number range. It always uses the
-local Nimslo source directory and the `best` preset, then writes both formats
-from the same alignment run:
+The `nap` shell alias accepts an inclusive batch-number range. Configure its
+local source and destinations once:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env`:
+
+```dotenv
+NAP_INPUT_DIR=~/path/to/nimslo
+NAP_GIF_OUTPUT_DIR=~/path/to/wigglegrams
+NAP_MP4_OUTPUT_DIR=~/path/to/wigglegrams/output_mp4
+```
+
+`.env` is gitignored; `.env.example` documents the portable configuration.
+Existing process environment variables take precedence over values in the
+file. Range mode uses the `best` preset and writes both formats from one
+alignment run:
 
 ```bash
 nap 20 137
 ```
 
-Outputs are written as:
-
-- GIF: `~/path/to/wigglegrams/20.gif`
-- MP4: `~/path/to/wigglegrams/output_mp4/20.mp4`
-
-Replace `20` with each batch number in the requested range. Existing output
-files are overwritten. Use `--longer N` if the MP4 should repeat its boomerang
-sequence more than once.
+Output filenames use each batch number. Existing files are overwritten. Use
+`--longer N` if the MP4 should repeat its boomerang sequence more than once.
 
 ### with visualizations
 
 ```bash
 python nimslo_visualize.py ./nimslo_raw/01/ -o output.gif --viz-dir ./viz/
 ```
+
+### interactive subject selection (experimental)
+
+For a batch where automatic segmentation selects the wrong subject, use the
+terminal-native picker:
+
+```bash
+python nimslo_cli.py ./nimslo_raw/134/ --interactive -o 134.gif
+```
+
+The picker uses the Kitty graphics protocol and pixel mouse reporting, both
+supported by Ghostty. Click the subject in frame 1. The picker tracks a local
+feature cloud through the remaining frames and shows all proposed anchors.
+Click any frame to correct its anchor, press Enter to accept, or press `q` /
+Escape to cancel.
+
+The accepted anchors create local ROI masks for subject-specific SIFT matching;
+they do not add a new segmentation model. Interactive mode currently handles
+one batch at a time and must run in an attached compatible terminal.
 
 ## usage
 
@@ -124,12 +153,12 @@ options:
 
 range mode:
   `nap START END` always uses best quality and writes both a GIF and MP4 for each
-  existing numbered batch. GIFs are written to
-  `~/path/to/wigglegrams/`; MP4s are written to
-  `~/path/to/wigglegrams/output_mp4/`.
+  existing numbered batch. Paths come from NAP_INPUT_DIR,
+  NAP_GIF_OUTPUT_DIR, and NAP_MP4_OUTPUT_DIR in the environment or local .env.
   -q, --quality         quality preset: fast, balanced (default), best
   --format              output format: gif or mp4 (otherwise inferred from -o)
   --show-masks          save segmentation mask visualization
+  --interactive         select and review subject anchors in the terminal
   --preview             open result after processing (single mode only)
   -v, --verbose         enable verbose output
   --loops / --longer N  mp4 only: repeat boomerang sequence N times

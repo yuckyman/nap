@@ -12,6 +12,7 @@ Usage:
 
 import sys
 import argparse
+import os
 from pathlib import Path
 from typing import Optional, List
 import logging
@@ -23,6 +24,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+RANGE_PATH_VARIABLES = (
+    "NAP_INPUT_DIR",
+    "NAP_GIF_OUTPUT_DIR",
+    "NAP_MP4_OUTPUT_DIR",
+)
+
 
 def setup_path():
     """Add the code directory to the path for imports."""
@@ -31,12 +38,53 @@ def setup_path():
         sys.path.insert(0, str(code_dir))
 
 
+def load_dotenv(path: Optional[Path] = None) -> None:
+    """Load simple KEY=VALUE settings without overriding the process environment."""
+    env_path = path or Path(__file__).with_name(".env")
+    if not env_path.is_file():
+        return
+
+    for line_number, raw_line in enumerate(
+        env_path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if not separator or not key.isidentifier():
+            raise ValueError(f"Invalid .env entry on line {line_number}: {raw_line}")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+def configured_range_paths() -> tuple[Path, Path, Path]:
+    """Resolve the input, GIF, and MP4 directories used by range mode."""
+    missing = [name for name in RANGE_PATH_VARIABLES if not os.environ.get(name)]
+    if missing:
+        names = ", ".join(missing)
+        raise ValueError(
+            f"Range mode requires {names}. Copy .env.example to .env and configure it."
+        )
+
+    return tuple(
+        Path(os.path.expandvars(os.environ[name])).expanduser()
+        for name in RANGE_PATH_VARIABLES
+    )
+
+
 def process_single_batch(
     batch_path: Path,
     output_path: Path,
     output_format: str,
     quality: str = "best",
     show_masks: bool = False,
+    interactive: bool = False,
     preview: bool = False,
     mp4_loops: Optional[int] = None,
     mp4_output_path: Optional[Path] = None,
@@ -49,6 +97,7 @@ def process_single_batch(
         output_path: Path for output GIF
         quality: Quality preset ("fast", "balanced", "best")
         show_masks: Whether to save mask visualization
+        interactive: Whether to select and review subject anchors in the terminal
         preview: Whether to open result after processing
         
     Returns:
@@ -111,13 +160,26 @@ def process_single_batch(
         preprocessed = [preprocess_image(img, denoise=settings["denoise"]) for img in images_original]
         preprocessed = normalize_sizes(preprocessed)
         
-        # Segment (batched, downscaled, coreml on mac)
-        logger.info("  Segmenting subjects...")
-        seg_results = segment_images(preprocessed, FAST_SEGMENTATION)
-        masks = []
-        for i, (mask, conf) in enumerate(seg_results):
-            masks.append(mask)
-            logger.info(f"    Frame {i+1}: {FAST_SEGMENTATION.model} (conf: {conf:.2f})")
+        subject_centers = None
+        if interactive:
+            from nimslo_core.terminal_picker import (
+                create_subject_roi_masks,
+                select_subject_points,
+            )
+
+            logger.info("  Select a subject in the terminal...")
+            subject_centers = select_subject_points(images_original)
+            masks = create_subject_roi_masks(preprocessed, subject_centers)
+            for i, (x, y) in enumerate(subject_centers):
+                logger.info(f"    Frame {i+1}: anchor ({x:.1f}, {y:.1f})")
+        else:
+            # Segment (batched, downscaled, coreml on mac)
+            logger.info("  Segmenting subjects...")
+            seg_results = segment_images(preprocessed, FAST_SEGMENTATION)
+            masks = []
+            for i, (mask, conf) in enumerate(seg_results):
+                masks.append(mask)
+                logger.info(f"    Frame {i+1}: {FAST_SEGMENTATION.model} (conf: {conf:.2f})")
         
         # Save mask visualization if requested
         if show_masks:
@@ -141,7 +203,9 @@ def process_single_batch(
         # Center images on subjects
         logger.info("  Centering images on subjects...")
         centered_images, centered_masks, center_transforms = center_images_on_subject(
-            preprocessed, masks
+            preprocessed,
+            masks,
+            subject_centers=subject_centers,
         )
         
         # Align (on centered images)
@@ -408,6 +472,12 @@ Examples:
         action="store_true",
         help="Save segmentation mask visualization"
     )
+
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Select and review subject anchors with the mouse in a supported terminal"
+    )
     
     parser.add_argument(
         "--preview",
@@ -439,11 +509,19 @@ Examples:
     
     # Set up imports
     setup_path()
+    try:
+        load_dotenv()
+    except (OSError, ValueError) as exc:
+        logger.error(f"Could not load .env: {exc}")
+        sys.exit(2)
 
     # `nap START END` is the convenient range command. It intentionally uses
     # fixed project paths so every batch gets the same best-quality treatment.
     if args.batch and args.end is not None:
         logger.error("Use either `--batch` or range mode (`nap START END`), not both")
+        sys.exit(2)
+    if args.interactive and (args.batch or args.end is not None):
+        logger.error("--interactive currently supports one batch at a time")
         sys.exit(2)
     if args.end is not None:
         try:
@@ -452,9 +530,11 @@ Examples:
             logger.error("Range mode requires numeric batch numbers: nap START END")
             sys.exit(2)
 
-        input_root = Path.home() / "path/to/nimslo"
-        gif_root = Path.home() / "path/to/wigglegrams"
-        mp4_root = gif_root / "output_mp4"
+        try:
+            input_root, gif_root, mp4_root = configured_range_paths()
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(2)
         if not input_root.is_dir():
             logger.error(f"Nimslo input directory does not exist: {input_root}")
             sys.exit(1)
@@ -531,6 +611,7 @@ Examples:
             output_format=output_format,
             quality=args.quality,
             show_masks=args.show_masks,
+            interactive=args.interactive,
             preview=args.preview,
             mp4_loops=(args.loops if args.loops is not None else (args.longer if args.longer is not None else None)),
         )
