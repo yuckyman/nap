@@ -31,7 +31,7 @@ shared upstream for all variants:
 | `proc_affine` | **affine partial** | centroid |
 | `proc_homog` | homography | centroid |
 
-canonical test set: `~/path/to/nimslo/` (84 four-image batches).
+canonical test set: local nimslo roll directory (84 four-image batches; set `NAP_INPUT_DIR` in `.env`).
 
 ### results (mean across 12 rolls)
 
@@ -70,7 +70,7 @@ removed experiment cli flags (`--transform-model`, `--ransac-model`, `--max-rota
 
 ```bash
 python benchmark_alignment.py \
-  --input ~/path/to/nimslo \
+  --input "$NAP_INPUT_DIR" \
   --output benchmark_output \
   --write-gifs --limit 12 --stride 7
 ```
@@ -83,7 +83,7 @@ quantifies per-stage wall time on real batches. run:
 
 ```bash
 python profile_pipeline.py ./nimslo_raw/61/
-python profile_pipeline.py --input ~/path/to/nimslo --limit 5
+python profile_pipeline.py --input "$NAP_INPUT_DIR" --limit 5
 python profile_pipeline.py ./batch/ --segmentation-only --runs 3
 ```
 
