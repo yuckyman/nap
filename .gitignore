@@ -49,6 +49,7 @@ Thumbs.db
 
 # Project specific
 *.gif
+!assets/*.gif
 *.jpg
 *.png
 *.mp4

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/aldn4thumb.gif" alt="Nimslo wigglegram — live show parallax" width="420">
+</p>
+
 # nap (nimslo alignment pipeline)
 
 a python pipeline for aligning 4-lens nimslo camera photos into smooth stereoscopic boomerang gifs. takes 4 slightly offset images and aligns them so the subject stays in place while the background shifts, creating that classic nimslo parallax effect.
@@ -48,6 +52,7 @@ nap/
 ├── notes.md                   # experiment log (tracked)
 ├── benchmark_output/          # gitignored — csv/gif benchmark artifacts
 ├── profile_output/            # gitignored — profiler csv output
+├── assets/                    # readme media (tracked gifs; see .gitignore)
 ├── .env.example               # template for range / numeric interactive paths
 ├── nimslo_core/
 │   ├── preprocessing.py       # film grain reduction, exposure balancing
